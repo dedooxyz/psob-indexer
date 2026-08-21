@@ -1,0 +1,9 @@
+target/
+**/*.rs.bk
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+.env
+.DS_Store
