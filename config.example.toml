@@ -5,6 +5,9 @@
 # e.g. PSOB_CHAINS beats [[chains]].
 
 # ─── Aux chains to ingest ──────────────────────────────────────────────────────
+# Adding a chain is a new [[chains]] block — no code changes. For Dogecoin
+# later: chain_id = DOGE nVersion >> 16 (look it up in dogecoin core), an
+# Esplora URL serving raw headers, pow_limit_bits 0x1e0fffff.
 [[chains]]
 name = "JKC"
 chain_id = 8224
@@ -26,6 +29,7 @@ db_path = "psob-indexer.redb"
 base = "https://litecoinspace.org/api"
 api_key = ""
 parent_chain = "litecoin"
+# fallback_base = "https://another-explorer.example/api"
 
 # ─── Tuning ────────────────────────────────────────────────────────────────────
 max_batch = 64

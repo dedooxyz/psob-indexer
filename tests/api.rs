@@ -39,6 +39,7 @@ fn config() -> Config {
             base: "https://litecoinspace.org/api".into(),
             api_key: String::new(),
             chain_slug: "litecoin".into(),
+            fallback_base: None,
         },
         max_batch: 64,
         start_height: Some(1_000_000),

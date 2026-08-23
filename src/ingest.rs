@@ -82,11 +82,19 @@ impl Ingestor {
         metrics: Arc<Metrics>,
         p2p: Option<P2pHandle>,
     ) -> anyhow::Result<Self> {
-        let resolver = ParentResolver::new(
+        let resolver = ParentResolver::with_policy_and_fallback(
             &config.resolver.base,
             &config.resolver.api_key,
             &config.resolver.chain_slug,
-        )?;
+            chain_rpc::HttpPolicy {
+                timeout: config.http.timeout,
+                max_retries: config.retry.max_retries,
+                base_backoff: config.retry.base_backoff,
+                max_backoff: config.retry.max_backoff,
+                min_request_interval: config.retry.min_request_interval,
+            },
+            config.resolver.fallback_base.clone(),
+        );
         Ok(Self {
             config,
             db,

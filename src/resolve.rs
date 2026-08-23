@@ -42,6 +42,8 @@ pub struct ParentResolver {
     api_key: String,
     chain_slug: String,
     policy: HttpPolicy,
+    /// Optional secondary explorer used only on transport failure.
+    fallback_base: Option<String>,
 }
 
 /// The subset of the ccnodes `/{chain}/block/{hash}` block-summary payload we
@@ -72,6 +74,16 @@ impl ParentResolver {
         chain_slug: impl Into<String>,
         policy: HttpPolicy,
     ) -> Self {
+        Self::with_policy_and_fallback(base, api_key, chain_slug, policy, None)
+    }
+
+    pub fn with_policy_and_fallback(
+        base: impl Into<String>,
+        api_key: impl Into<String>,
+        chain_slug: impl Into<String>,
+        policy: HttpPolicy,
+        fallback_base: Option<String>,
+    ) -> Self {
         Self {
             // Timeout mirrors chain-rpc's fix for junk-api's silent-TCP behavior.
             http: Arc::new(
@@ -84,6 +96,7 @@ impl ParentResolver {
             api_key: api_key.into(),
             chain_slug: chain_slug.into(),
             policy,
+            fallback_base: fallback_base.map(|b| b.trim_end_matches('/').to_string()),
         }
     }
 
@@ -138,22 +151,24 @@ impl ParentResolver {
                     return Ok(None);
                 }
                 Err(_) => {
-                    // Transport failure — try the litecoinspace fallback once,
-                    // then retry the primary with backoff.
-                    if !attempted_fallback {
-                        attempted_fallback = true;
-                        let fallback_url =
-                            format!("https://litecoinspace.org/api/block/{hash_hex}");
-                        if let Ok(fb) = self.request(&fallback_url).await {
-                            if fb.status().is_success() {
-                                if let Ok(s) = fb.json::<BlockSummary>().await {
-                                    if s.id.to_lowercase() == hash_hex {
-                                        return Ok(Some(s.height));
+                    // Transport failure — consult the configured fallback
+                    // explorer once (if any), then retry the primary.
+                    if let Some(fb_base) = &self.fallback_base {
+                        if !attempted_fallback {
+                            attempted_fallback = true;
+                            let fallback_url =
+                                format!("{}/block/{hash_hex}", fb_base.trim_end_matches('/'));
+                            if let Ok(fb) = self.request(&fallback_url).await {
+                                if fb.status().is_success() {
+                                    if let Ok(s) = fb.json::<BlockSummary>().await {
+                                        if s.id.to_lowercase() == hash_hex {
+                                            return Ok(Some(s.height));
+                                        }
                                     }
                                 }
                             }
+                            continue;
                         }
-                        continue;
                     }
                     if attempt < self.policy.max_retries {
                         backoff(&self.policy, attempt).await;

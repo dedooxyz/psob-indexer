@@ -42,6 +42,9 @@ pub struct ResolverConfig {
     pub api_key: String,
     /// Chain slug of the parent chain, e.g. "litecoin".
     pub chain_slug: String,
+    /// Optional secondary explorer used ONLY on transport failure of the
+    /// primary (`PSOB_CCNODES_FALLBACK_BASE`). Never hardcoded.
+    pub fallback_base: Option<String>,
 }
 
 /// HTTP retry/backoff policy applied to every Electrs / resolver request.
@@ -125,6 +128,7 @@ struct ResolverFile {
     base: Option<String>,
     api_key: Option<String>,
     parent_chain: Option<String>,
+    fallback_base: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -184,6 +188,9 @@ impl Config {
         let parent_chain = env_var("PSOB_PARENT_CHAIN")?
             .or_else(|| file.as_ref().and_then(|f| f.resolver.parent_chain.clone()))
             .unwrap_or_else(|| "litecoin".to_string());
+        let fallback_base = env_var("PSOB_CCNODES_FALLBACK_BASE")?
+            .or_else(|| file.as_ref().and_then(|f| f.resolver.fallback_base.clone()))
+            .filter(|b| !b.is_empty());
 
         let max_batch = env_num("PSOB_MAX_BATCH")?
             .or_else(|| file.as_ref().and_then(|f| f.max_batch))
@@ -252,6 +259,7 @@ impl Config {
                 base: resolver_base,
                 api_key: resolver_key,
                 chain_slug: parent_chain,
+                fallback_base,
             },
             max_batch: max_batch.max(1),
             start_height,
@@ -398,6 +406,30 @@ mod tests {
         assert!(parse_chain_specs("JKC|not_a_number|url|0x1e0fffff").is_err());
         assert!(parse_chain_specs("JKC|8224||0x1e0fffff").is_err());
         assert!(parse_chain_specs("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolver_fallback_is_optional_and_parseable() {
+        // env-based (values are set by the test harness): simulate via the
+        // parse helpers when the env is absent — the file path is what matters.
+        #[derive(Deserialize)]
+        struct Min {
+            resolver: ResolverFile,
+        }
+        let m: Min = toml::from_str(
+            r#"
+            [resolver]
+            fallback_base = "https://fallback.example/api"
+            "#,
+        )
+        .expect("toml");
+        assert_eq!(
+            m.resolver.fallback_base.as_deref(),
+            Some("https://fallback.example/api")
+        );
+
+        let m2: Min = toml::from_str("[resolver]").expect("defaults");
+        assert!(m2.resolver.fallback_base.is_none());
     }
 
     #[test]
