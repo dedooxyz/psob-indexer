@@ -2,8 +2,7 @@
 
 High-performance Rust indexer for the Litecoin AuxPoW ecosystem: it ingests
 merge-mined block headers from **Junkcoin (JKC), Dingocoin (DINGO), Luckycoin
-(LKY), Shibacoin (SHIC), TrumPOW (TRMP), Craftcoin (CRC), B1tcore (B1T), and
-Lebowskis (LBW)**, light-verifies their PSob consensus proofs, and indexes the
+(LKY), Shibacoin (SHIC), TrumPOW (TRMP), Craftcoin (CRC), B1tcore (B1T)**, light-verifies their PSob consensus proofs, and indexes the
 shared Litecoin parent anchors that make trust-minimized cross-chain
 verification possible.
 
@@ -11,7 +10,7 @@ verification possible.
        aux chains                     parent chain (Litecoin)
  ┌───────────────────────┐         ┌───────────────────────┐
  │ JKC  DINGO  LKY  SHIC │         │  block L               │
- │ TRMP  CRC  B1T  LBW   │  ─────► │  coinbase commits      │
+ │ TRMP  CRC  B1T         │  ─────► │  coinbase commits      │
  │ (merge-mined blocks)  │ CAuxPow │  aux merkle root R     │
  │  one shared parent ?  │         └───────────────────────┘
  └───────────────────────┘
