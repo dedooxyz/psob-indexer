@@ -27,6 +27,7 @@
 //! headers against the parent chain, and (c) gossips the batch tip on
 //! `/psob/headers/v1` and newly found sibling groups on `/psob/siblings/v1`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +64,11 @@ pub struct Ingestor {
     resolver: ParentResolver,
     metrics: Arc<Metrics>,
     p2p: Option<P2pHandle>,
+    /// Parents already gossiped on /psob/siblings/v1. Shared by ALL chain tasks
+    /// so a parent shared by several chains is announced exactly once; the
+    /// first classifying task wins (memory-only: a restart re-announces, which
+    /// gossip-level dedup absorbs).
+    announced: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
 }
 
 impl Ingestor {
@@ -87,6 +93,7 @@ impl Ingestor {
             resolver,
             metrics,
             p2p,
+            announced: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -103,8 +110,9 @@ impl Ingestor {
                 let config = self.config.clone();
                 let metrics = Arc::clone(&self.metrics);
                 let p2p = self.p2p.clone();
+                let announced = Arc::clone(&self.announced);
                 tokio::spawn(async move {
-                    chain_loop(config, db, resolver, metrics, p2p, chain).await;
+                    chain_loop(config, db, resolver, metrics, p2p, announced, chain).await;
                 })
             })
             .collect()
@@ -135,6 +143,7 @@ async fn chain_loop(
     resolver: ParentResolver,
     metrics: Arc<Metrics>,
     p2p: Option<P2pHandle>,
+    announced: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
     chain: AuxChain,
 ) {
     tracing::info!(
@@ -185,7 +194,7 @@ async fn chain_loop(
                     announce_batch_tip(&db, &p2p, &chain, &batch).await;
                 }
                 for parent in &batch.new_mainnet_parents {
-                    announce_sibling_group(&db, &p2p, parent).await;
+                    announce_sibling_group(&db, &p2p, &announced, parent).await;
                 }
             }
             Err(e) => {
@@ -239,8 +248,22 @@ async fn announce_batch_tip(
 }
 
 /// Gossip a newly discovered sibling group on `/psob/siblings/v1`.
-async fn announce_sibling_group(db: &Database, p2p: &Option<P2pHandle>, parent: &[u8; 32]) {
+async fn announce_sibling_group(
+    db: &Database,
+    p2p: &Option<P2pHandle>,
+    announced: &Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
+    parent: &[u8; 32],
+) {
     let Some(handle) = p2p else { return };
+    // One announcement per parent, across ALL chain tasks.
+    let first_time = {
+        let mut set = announced.lock().expect("announced mutex poisoned");
+        set.insert(*parent)
+    };
+    if !first_time {
+        tracing::debug!(parent = %display_hash(parent), "sibling group already announced");
+        return;
+    }
     // Only advertise provable groups: mainnet parent, >= 2 distinct chains.
     let Ok(Some(parent_info)) = db.get_parent(parent) else {
         return;

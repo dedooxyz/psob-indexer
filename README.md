@@ -89,7 +89,12 @@ a volume, and ships a Docker HEALTHCHECK against `/api/v1/health`.
 HTTP counters + latency histograms by route, per-chain ingest/cursor gauges,
 ingest-error and prune counters, resolver classification counters, and the
 sibling-group/parent gauges (refreshed at scrape time from the L1 cache).
-Grafana/Prometheus YAML ships in `prometheus.yml`.
+Grafana/Prometheus YAML ships in `prometheus.yml`, and a ready-made dashboard
+lives at `grafana/psob-indexer-dashboard.json` (Import → Grafana; the
+datasource template variable `DS_PROMETHEUS` is auto-filled by the query).
+Uptime, per-chain ingest rate/errors, cursors, indexed-block gauges, sibling
+groups, parent classification splits, prune drops, and API p50/p95/p99 by
+route are all covered.
 
 ### Bounded-window operation
 

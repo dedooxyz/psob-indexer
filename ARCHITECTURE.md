@@ -132,7 +132,11 @@ intents:
   `ingest_errors_total{chain_id}`, `prune_blocks_total{chain_id}`,
   `parent_resolves_total{state}` — per-chain ingest health.
 - `indexed_blocks{chain_id}`, `chain_cursor{chain_id}`, `sibling_groups`,
-  `indexed_parents` — DB gauges refreshed at scrape time from the L1 cache.
+  `indexed_parents`, `uptime_seconds` — DB gauges refreshed at scrape time
+  from the L1 cache.
+
+A ready-made Grafana dashboard ships in `grafana/psob-indexer-dashboard.json`
+(ingest, prune, classification, and HTTP latency panels).
 
 ## 6.2 Bounded-window pruning
 

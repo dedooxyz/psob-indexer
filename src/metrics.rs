@@ -35,6 +35,8 @@ pub struct Metrics {
     pub chain_cursor: IntGaugeVec,
     pub sibling_groups: IntGauge,
     pub indexed_parents: IntGauge,
+    pub uptime_seconds: IntGauge,
+    started_at: std::time::Instant,
 }
 
 impl Metrics {
@@ -100,6 +102,11 @@ impl Metrics {
             "Distinct embedded parent headers".to_string(),
         )
         .unwrap();
+        let uptime_seconds = IntGauge::new(
+            "uptime_seconds".to_string(),
+            "Node uptime in seconds".to_string(),
+        )
+        .unwrap();
 
         for c in [
             &http_requests,
@@ -121,8 +128,10 @@ impl Metrics {
         registry
             .register(Box::new(indexed_parents.clone()))
             .unwrap();
+        registry.register(Box::new(uptime_seconds.clone())).unwrap();
 
         Arc::new(Self {
+            started_at: std::time::Instant::now(),
             registry,
             http_requests,
             http_request_seconds,
@@ -135,11 +144,14 @@ impl Metrics {
             chain_cursor,
             sibling_groups,
             indexed_parents,
+            uptime_seconds,
         })
     }
 
     /// Refresh DB-derived gauges and render the registry.
     pub fn render(&self, db: &Database) -> String {
+        self.uptime_seconds
+            .set(self.started_at.elapsed().as_secs() as i64);
         if let Ok(stats) = db.stats() {
             for c in &stats.chains {
                 let label = c.chain_id.to_string();
