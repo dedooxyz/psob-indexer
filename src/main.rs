@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use psob_indexer::config::Config;
 use psob_indexer::db::Database;
+use psob_indexer::metrics::Metrics;
 use psob_indexer::p2p::swarm::start_p2p_swarm;
 use psob_indexer::server::{create_router, AppState};
 
@@ -49,7 +50,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let state = AppState::new(Arc::clone(&db), config.clone(), p2p_handle);
+    let metrics = Metrics::new();
+    let state = AppState::new(
+        Arc::clone(&db),
+        config.clone(),
+        p2p_handle.clone(),
+        Arc::clone(&metrics),
+    );
     let router = create_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "started psob-indexer HTTP REST API (docs at /docs)");
@@ -58,7 +65,12 @@ async fn main() -> anyhow::Result<()> {
     let db_for_ingest = Arc::clone(&db);
     let config_for_ingest = config.clone();
     let ingest_task = tokio::spawn(async move {
-        let ingestor = match psob_indexer::ingest::Ingestor::new(config_for_ingest, db_for_ingest) {
+        let ingestor = match psob_indexer::ingest::Ingestor::with_services(
+            config_for_ingest,
+            db_for_ingest,
+            Arc::clone(&metrics),
+            p2p_handle,
+        ) {
             Ok(i) => i,
             Err(e) => {
                 tracing::error!("failed to construct ingestor: {e}");

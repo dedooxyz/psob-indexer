@@ -70,6 +70,47 @@ NAME|CHAIN_ID|ELECTRS_URL|POWLIMIT_BITS_HEX[|START_HEIGHT]
 | `POWLIMIT_BITS_HEX` | consensus powLimit in compact nBits (`0x1e0fffff` = scrypt family) |
 | `START_HEIGHT` | cursor seed for fresh DBs — the walk ingests `START_HEIGHT+1..tip` |
 
+### Run in Docker
+
+```bash
+docker build -t psob-indexer .
+docker run --rm -p 8080:8080 -p 9000:9000 -v psob-data:/data   -e PSOB_CHAINS='JKC|8224|https://junk-api.s3na.xyz|0x1e0fffff|1095300'   -e PSOB_DB_PATH=/data/psob-indexer.redb psob-indexer
+
+# or with the compose file (includes optional Prometheus scraper):
+docker compose up -d
+```
+
+The image is multi-stage (rust:bookworm → debian-slim), exposes the datadir as
+a volume, and ships a Docker HEALTHCHECK against `/api/v1/health`.
+
+### Observability
+
+`GET /metrics` speaks the Prometheus exposition format (`psob_indexer_*`):
+HTTP counters + latency histograms by route, per-chain ingest/cursor gauges,
+ingest-error and prune counters, resolver classification counters, and the
+sibling-group/parent gauges (refreshed at scrape time from the L1 cache).
+Grafana/Prometheus YAML ships in `prometheus.yml`.
+
+### Bounded-window operation
+
+Set `PSOB_MAX_KEPT_BLOCKS=500000` to keep only the most recent N blocks per
+chain — the store prunes automatically after each tick once the window is
+overshot (`db.prune_before`, range deletes, never touches the cursor). Old
+epoch windows simply serve fewer rows; parents stay classified.
+
+### P2P gossip payloads
+
+With the swarm enabled the indexer now *publishes* verified data, not only
+swap intents:
+
+| Topic | Emitted when | Payload |
+|---|---|---|
+| `/psob/headers/v1` | each ingest batch | the batch tip: chain_id, height, hashes, `auxpow_hex` |
+| `/psob/siblings/v1` | a parent becomes mainnet with ≥2 legs | parent, `ltc_height`, leg list |
+| `/psob/intents/v1` | `/api/v1/p2p/broadcast` | signed swap intent |
+
+Every header payload is self-verifiable on the receiving side.
+
 ### Tooling
 
 ```bash
@@ -96,6 +137,7 @@ Full docs: [API.md](API.md), interactive at `/docs`.
 | `GET` | `/api/v1/epoch/:ltc_start/:ltc_end` | Paged epoch witness blocks |
 | `GET` | `/api/v1/epoch/latest` | Latest sibling group |
 | `POST` | `/api/v1/verify` | Client-driven full verification of any wire |
+| `GET` | `/metrics` | Prometheus exposition |
 | `GET` | `/api/v1/p2p/*`, `POST /api/v1/p2p/broadcast` | Gossip mesh queries |
 
 **Endianness contract** (also in API.md): `block_hash` / `parent_hash` are

@@ -31,6 +31,8 @@ parent_chain = "litecoin"
 max_batch = 64
 poll_interval_secs = 15
 # start_height = 1000000
+# Bounded-window mode: keep only the most recent N blocks per chain.
+# max_kept_blocks = 500000
 
 [retry]
 max_retries = 5

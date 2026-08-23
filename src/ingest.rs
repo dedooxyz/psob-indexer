@@ -21,19 +21,39 @@
 //! move off-circuit. A header failing a cheap check is logged and the chain
 //! scan stops at that height (a reorg or a malformed block should halt the walk
 //! rather than poison the store).
+//!
+//! After a successful tick the ingestor optionally: (a) prunes the chain to a
+//! bounded window (`PSOB_MAX_KEPT_BLOCKS`), (b) resolves newly seen parent
+//! headers against the parent chain, and (c) gossips the batch tip on
+//! `/psob/headers/v1` and newly found sibling groups on `/psob/siblings/v1`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use chain_rpc::ElectrsClient;
-use futures::future::join_all;
 use tokio::task::JoinHandle;
 
 use crate::config::{AuxChain, Config};
 use crate::db::{Database, StoredBlock};
+use crate::metrics::Metrics;
+use crate::p2p::P2pHandle;
 use crate::resolve::ParentResolver;
 use crate::verify::{light_verify, AuxBlock};
+
+/// One successful (or partially halted) ingest tick.
+pub struct IngestBatch {
+    pub blocks: Vec<StoredBlock>,
+    /// Fully resolved LTC parents that just became mainnet during this tick.
+    pub new_mainnet_parents: Vec<[u8; 32]>,
+}
+
+impl IngestBatch {
+    /// The tallest block of the batch (the new chain head, if any).
+    pub fn head(&self) -> Option<&StoredBlock> {
+        self.blocks.last()
+    }
+}
 
 /// Runs the ingest loops for every configured chain. Long-lived; spawned per
 /// chain so failures stay chain-scoped.
@@ -41,10 +61,21 @@ pub struct Ingestor {
     config: Config,
     db: Arc<Database>,
     resolver: ParentResolver,
+    metrics: Arc<Metrics>,
+    p2p: Option<P2pHandle>,
 }
 
 impl Ingestor {
     pub fn new(config: Config, db: Arc<Database>) -> anyhow::Result<Self> {
+        Self::with_services(config, db, Metrics::new(), None)
+    }
+
+    pub fn with_services(
+        config: Config,
+        db: Arc<Database>,
+        metrics: Arc<Metrics>,
+        p2p: Option<P2pHandle>,
+    ) -> anyhow::Result<Self> {
         let resolver = ParentResolver::new(
             &config.resolver.base,
             &config.resolver.api_key,
@@ -54,6 +85,8 @@ impl Ingestor {
             config,
             db,
             resolver,
+            metrics,
+            p2p,
         })
     }
 
@@ -68,17 +101,48 @@ impl Ingestor {
                 let db = Arc::clone(&self.db);
                 let resolver = self.resolver.clone();
                 let config = self.config.clone();
+                let metrics = Arc::clone(&self.metrics);
+                let p2p = self.p2p.clone();
                 tokio::spawn(async move {
-                    chain_loop(config, db, resolver, chain).await;
+                    chain_loop(config, db, resolver, metrics, p2p, chain).await;
                 })
             })
             .collect()
     }
 }
 
+fn display_hash(le: &[u8; 32]) -> String {
+    let mut b = *le;
+    b.reverse();
+    hex::encode(b)
+}
+
+fn parent_hash_of(block: &StoredBlock) -> [u8; 32] {
+    common::sha256d(
+        &block
+            .header
+            .aux
+            .as_ref()
+            .expect("stored blocks always carry auxpow")
+            .parent_header,
+    )
+}
+
 /// One chain's infinite loop: tick → poll → backoff on error → retry.
-async fn chain_loop(config: Config, db: Arc<Database>, resolver: ParentResolver, chain: AuxChain) {
-    tracing::info!(chain = %chain.name, chain_id = chain.chain_id, url = %chain.electrs, "ingest loop started");
+async fn chain_loop(
+    config: Config,
+    db: Arc<Database>,
+    resolver: ParentResolver,
+    metrics: Arc<Metrics>,
+    p2p: Option<P2pHandle>,
+    chain: AuxChain,
+) {
+    tracing::info!(
+        chain = %chain.name,
+        chain_id = chain.chain_id,
+        url = %chain.electrs,
+        "ingest loop started"
+    );
     let client = ElectrsClient::with_policy(
         &chain.electrs,
         chain_rpc::HttpPolicy {
@@ -93,15 +157,43 @@ async fn chain_loop(config: Config, db: Arc<Database>, resolver: ParentResolver,
     let mut consecutive_failures = 0u32;
 
     loop {
-        match ingest_chain(&config, &chain, &client, &db, &resolver, config.max_batch).await {
-            Ok(ingested) => {
+        let chain_label = chain.chain_id.to_string();
+        metrics
+            .ingest_ticks
+            .with_label_values(&[&chain_label])
+            .inc();
+        match ingest_chain(
+            &config,
+            &chain,
+            &client,
+            &db,
+            &resolver,
+            &metrics,
+            config.max_batch,
+        )
+        .await
+        {
+            Ok(batch) => {
                 consecutive_failures = 0;
+                let ingested = batch.blocks.len();
                 if ingested > 0 {
+                    metrics
+                        .ingest_blocks
+                        .with_label_values(&[&chain_label])
+                        .inc_by(ingested as u64);
                     tracing::info!(chain = %chain.name, ingested, "ingest batch");
+                    announce_batch_tip(&db, &p2p, &chain, &batch).await;
+                }
+                for parent in &batch.new_mainnet_parents {
+                    announce_sibling_group(&db, &p2p, parent).await;
                 }
             }
             Err(e) => {
                 consecutive_failures += 1;
+                metrics
+                    .ingest_errors
+                    .with_label_values(&[&chain_label])
+                    .inc();
                 let delay = backoff_delay(&config, consecutive_failures);
                 tracing::warn!(
                     chain = %chain.name,
@@ -116,6 +208,71 @@ async fn chain_loop(config: Config, db: Arc<Database>, resolver: ParentResolver,
         }
         tokio::time::sleep(config.poll_interval).await;
     }
+}
+
+/// Gossip the tallest block of the batch on `/psob/headers/v1`.
+async fn announce_batch_tip(
+    db: &Database,
+    p2p: &Option<P2pHandle>,
+    chain: &AuxChain,
+    batch: &IngestBatch,
+) {
+    let (Some(head), Some(handle)) = (batch.head(), p2p) else {
+        return;
+    };
+    let parent = parent_hash_of(head);
+    let ltc_height = db
+        .get_parent(&parent)
+        .ok()
+        .flatten()
+        .and_then(|p| p.ltc_height);
+    handle
+        .announce_header(
+            chain.chain_id,
+            head.height,
+            display_hash(&head.hash_le),
+            display_hash(&parent),
+            ltc_height,
+            head.wire_hex.clone(),
+        )
+        .await;
+}
+
+/// Gossip a newly discovered sibling group on `/psob/siblings/v1`.
+async fn announce_sibling_group(db: &Database, p2p: &Option<P2pHandle>, parent: &[u8; 32]) {
+    let Some(handle) = p2p else { return };
+    // Only advertise provable groups: mainnet parent, >= 2 distinct chains.
+    let Ok(Some(parent_info)) = db.get_parent(parent) else {
+        return;
+    };
+    let Some(ltc_height) = parent_info.ltc_height else {
+        return;
+    };
+    let Ok(siblings) = db.siblings_for_parent(parent) else {
+        return;
+    };
+    let mut chains: std::collections::BTreeMap<u32, u64> = Default::default();
+    for s in &siblings {
+        chains
+            .entry(s.chain_id)
+            .and_modify(|h| *h = (*h).min(s.height))
+            .or_insert(s.height);
+    }
+    if chains.len() < 2 {
+        return;
+    }
+    let legs: Vec<(u32, u64, String)> = siblings
+        .iter()
+        .filter_map(|s| {
+            chains
+                .get(&s.chain_id)
+                .filter(|h| **h == s.height)
+                .map(|_| (s.chain_id, s.height, display_hash(&s.hash_le)))
+        })
+        .collect();
+    handle
+        .announce_sibling(display_hash(parent), ltc_height, legs)
+        .await;
 }
 
 /// Exponential backoff with full jitter, capped (shared shape with the RPC client).
@@ -139,8 +296,9 @@ async fn ingest_chain(
     electrs: &ElectrsClient,
     db: &Database,
     resolver: &ParentResolver,
+    metrics: &Metrics,
     max_batch: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<IngestBatch> {
     db.upsert_chain(chain.chain_id, &chain.name, &chain.electrs)?;
 
     let tip_height = electrs.tip_height().await.context("tip_height")?;
@@ -168,13 +326,19 @@ async fn ingest_chain(
             tip_height,
             "DB cursor is above the node tip (node pruned or reorged?)"
         );
-        return Ok(0);
+        return Ok(IngestBatch {
+            blocks: vec![],
+            new_mainnet_parents: vec![],
+        });
     }
 
     let start = cursor.saturating_add(1);
     let end = (cursor + max_batch).min(tip_height);
     if start > end {
-        return Ok(0); // up to date
+        return Ok(IngestBatch {
+            blocks: vec![],
+            new_mainnet_parents: vec![],
+        }); // up to date
     }
     let window: Vec<u64> = (start..=end).collect();
 
@@ -221,7 +385,6 @@ async fn ingest_chain(
     };
 
     let mut pending: Vec<StoredBlock> = Vec::new();
-    let mut stop_after: Option<u64> = None;
 
     for height in window {
         let Some(wire) = wires.get(&height) else {
@@ -231,7 +394,6 @@ async fn ingest_chain(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(chain = %chain.name, height, err = %e, "auxpow parse failed at height; halting walk");
-                stop_after = Some(height);
                 break;
             }
         };
@@ -251,7 +413,6 @@ async fn ingest_chain(
                     err = %e,
                     "light verify failed at height; halting walk"
                 );
-                stop_after = Some(height);
                 break;
             }
         };
@@ -267,7 +428,6 @@ async fn ingest_chain(
                     "prev_hash linkage broken at {height} (reorg?) — rolling back and halting"
                 );
                 db.rollback_from(chain.chain_id, height)?;
-                stop_after = Some(height);
                 break;
             }
         }
@@ -293,51 +453,90 @@ async fn ingest_chain(
             .map(|b| b.height)
             .unwrap_or(start.saturating_sub(1));
         db.set_cursor_height(chain.chain_id, last)?;
-    } else if let Some(h) = stop_after {
-        // Nothing new stored; no cursor advance (the bad/rolled-back zone stays
-        // re-scannable next tick).
-        let _ = h;
+
+        // Bounded-window policy: drop history older than max_kept_blocks so a
+        // long-running node stays small. Runs when the window is exceeded;
+        // cheap because it's a range remove that only activates on drift.
+        if let Some(max_kept) = config.max_kept_blocks {
+            let below = last.saturating_sub(max_kept).saturating_add(1);
+            if below > 1 {
+                let stats = db.stats()?;
+                if let Some(min) = stats
+                    .chains
+                    .iter()
+                    .find(|c| c.chain_id == chain.chain_id)
+                    .and_then(|c| c.min_height)
+                {
+                    if min < below {
+                        let removed = db.prune_before(chain.chain_id, below)?;
+                        metrics
+                            .prune_blocks
+                            .with_label_values(&[&chain.chain_id.to_string()])
+                            .inc_by(removed);
+                        tracing::info!(
+                            chain = %chain.name,
+                            window = max_kept,
+                            pruned = removed,
+                            "pruned old blocks to bounded window"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Classify any previously unseen parents against the parent chain (mainnet).
-    classify_pending_parents(db, resolver, config).await?;
+    let new_mainnet = classify_pending_parents(db, resolver, metrics, config).await?;
 
-    Ok(pending.len() as u64)
+    Ok(IngestBatch {
+        blocks: pending,
+        new_mainnet_parents: new_mainnet,
+    })
 }
 
 /// Resolve unclassified parents concurrently (bounded). Classifications are
 /// best-effort — a resolver that is down is retried next tick, never fatal.
+/// Returns the parents that JUST became confirmed mainnet (for gossip).
 async fn classify_pending_parents(
     db: &Database,
     resolver: &ParentResolver,
+    metrics: &Metrics,
     _config: &Config,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<[u8; 32]>> {
     let unclassified = db.unclassified_parents();
     if unclassified.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let results = join_all(unclassified.into_iter().map(|parent| {
         let resolver = resolver.clone();
         async move { (parent, resolver.resolve(&parent).await) }
     }))
     .await;
+
+    let mut new_mainnet = Vec::new();
     for (parent, resolved) in results {
         let ltc_height = resolved.ok().flatten();
         db.classify_parent(&parent, ltc_height)?;
-        let parent_display = {
-            let mut b = parent;
-            b.reverse();
-            hex::encode(b)
-        };
+        let parent_display = display_hash(&parent);
         match ltc_height {
             Some(h) => {
-                tracing::info!(parent = %parent_display, ltc_height = h, "parent is mainnet block")
+                metrics
+                    .family_resolves
+                    .with_label_values(&["mainnet"])
+                    .inc();
+                tracing::info!(parent = %parent_display, ltc_height = h, "parent is mainnet block");
+                new_mainnet.push(parent);
             }
-            None => tracing::debug!(parent = %parent_display, "parent not on mainnet (trial)"),
+            None => {
+                metrics.family_resolves.with_label_values(&["trial"]).inc();
+                tracing::debug!(parent = %parent_display, "parent not on mainnet (trial)");
+            }
         }
     }
-    Ok(())
+    Ok(new_mainnet)
 }
+
+use futures::future::join_all;
 
 /// Continuous ingest for all chains from a shared DB (kept for CLI/tests).
 pub async fn run(config: Config, db: Arc<Database>) -> anyhow::Result<()> {

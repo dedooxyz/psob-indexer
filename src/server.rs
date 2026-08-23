@@ -25,6 +25,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::{catch_panic::CatchPanicLayer, cors::CorsLayer, trace::TraceLayer};
+
+use crate::metrics::Metrics;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::config::Config;
@@ -38,15 +40,22 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub config: Config,
     pub p2p: Option<P2pHandle>,
+    pub metrics: Arc<Metrics>,
     started_at: Instant,
 }
 
 impl AppState {
-    pub fn new(db: Arc<Database>, config: Config, p2p: Option<P2pHandle>) -> Self {
+    pub fn new(
+        db: Arc<Database>,
+        config: Config,
+        p2p: Option<P2pHandle>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             db,
             config,
             p2p,
+            metrics,
             started_at: Instant::now(),
         }
     }
@@ -493,9 +502,35 @@ pub fn create_router(state: AppState) -> Router {
         )
     };
 
+    let metrics = Arc::clone(&state.metrics);
+    let metrics_middleware = axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let metrics = Arc::clone(&metrics);
+            async move {
+                let start = std::time::Instant::now();
+                let method = req.method().as_str().to_string();
+                let route = req
+                    .extensions()
+                    .get::<axum::extract::MatchedPath>()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_else(|| req.uri().path().to_string());
+                let resp = next.run(req).await;
+                metrics
+                    .http_requests
+                    .with_label_values(&[&method, &route])
+                    .inc();
+                metrics
+                    .http_request_seconds
+                    .with_label_values(&[&method, &route])
+                    .observe(start.elapsed().as_secs_f64());
+                resp
+            }
+        },
+    );
     let api: Router<()> = Router::new()
         .route("/health", get(health_handler))
         .route("/api/v1/health", get(health_handler))
+        .route("/metrics", get(crate::metrics::metrics_handler))
         .route("/api/v1/chains", get(chains_handler))
         .route("/api/v1/siblings", get(siblings_handler))
         .route("/api/v1/siblings/:parent_hash", get(sibling_detail_handler))
@@ -516,9 +551,10 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .merge(docs)
         .merge(api)
-        .layer(TraceLayer::new_for_http())
-        .layer(CatchPanicLayer::new())
         .layer(cors)
+        .layer(CatchPanicLayer::new())
+        .layer(metrics_middleware)
+        .layer(TraceLayer::new_for_http())
 }
 
 #[utoipa::path(
@@ -965,14 +1001,16 @@ async fn p2p_broadcast_handler(
     Json(intent): Json<SwapIntentMessage>,
 ) -> Response {
     match &state.p2p {
-        Some(handle) => match handle.tx_intent.send(intent.clone()).await {
-            Ok(_) => Json(json!({
+        Some(handle) => match handle.broadcast_intent(intent.clone()).await {
+            true => Json(json!({
                 "status": "broadcasted",
                 "intent_id": intent.intent_id,
                 "peer_count": handle.status.read().await.connected_peers_count,
             }))
             .into_response(),
-            Err(e) => ApiError::Internal(e.to_string()).into_response(),
+            false => {
+                ApiError::Internal("gossip channel closed (swarm down)".into()).into_response()
+            }
         },
         None => ApiError::Internal("P2P subsystem is not enabled".into()).into_response(),
     }

@@ -4,12 +4,27 @@
 //! - New AuxPoW block headers (`/psob/headers/v1`)
 //! - Discovered Sibling Litecoin parents (`/psob/siblings/v1`)
 //! - Cross-chain Swap Intents / Orders (`/psob/intents/v1`)
+//!
+//! `P2pHandle` is a thin in-process channel: the ingest loop and HTTP server
+//! enqueue [`GossipMessage`]s; the swarm loop publishes them on the matching
+//! topic. If the swarm is disabled, the channel simply never drains and the
+//! senders' callers ignore send failures.
 
 pub mod swarm;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// One message to publish on a gossip topic.
+#[derive(Clone, Debug)]
+pub struct GossipMessage {
+    /// IdentTopic name, e.g. `/psob/intents/v1`.
+    pub topic: String,
+    /// Wire payload (JSON).
+    pub payload: Vec<u8>,
+}
 
 /// Configuration for P2P Node.
 #[derive(Clone, Debug)]
@@ -77,6 +92,76 @@ pub struct P2pStatus {
 /// Handle to interact with the running P2P Swarm from other tasks (HTTP server, ingest loop).
 #[derive(Clone)]
 pub struct P2pHandle {
-    pub tx_intent: mpsc::Sender<SwapIntentMessage>,
+    pub tx_gossip: mpsc::Sender<GossipMessage>,
     pub status: Arc<tokio::sync::RwLock<P2pStatus>>,
+}
+
+impl P2pHandle {
+    /// Publish a JSON payload on a topic. Returns false when the swarm is down.
+    pub async fn publish_json(&self, topic: &str, payload: serde_json::Value) -> bool {
+        self.tx_gossip
+            .send(GossipMessage {
+                topic: topic.to_string(),
+                payload: payload.to_string().into_bytes(),
+            })
+            .await
+            .is_ok()
+    }
+
+    /// Publish a cross-chain swap intent. Wrapper kept for API stability.
+    pub async fn broadcast_intent(&self, intent: SwapIntentMessage) -> bool {
+        self.publish_json(
+            swarm::TOPIC_INTENTS,
+            serde_json::to_value(intent).unwrap_or(json!({})),
+        )
+        .await
+    }
+
+    /// Announce a verified aux header (the tallest of a batch per tick).
+    pub async fn announce_header(
+        &self,
+        chain_id: u32,
+        height: u64,
+        block_hash_display: String,
+        parent_hash_display: String,
+        ltc_height: Option<u64>,
+        auxpow_hex: String,
+    ) -> bool {
+        self.publish_json(
+            swarm::TOPIC_HEADERS,
+            json!({
+                "type": "header",
+                "chain_id": chain_id,
+                "height": height,
+                "block_hash": block_hash_display,
+                "parent_hash": parent_hash_display,
+                "ltc_height": ltc_height,
+                "auxpow_hex": auxpow_hex,
+            }),
+        )
+        .await
+    }
+
+    /// Announce a sibling group discovery (mainnet parent shared by >= 2 chains).
+    pub async fn announce_sibling(
+        &self,
+        parent_hash_display: String,
+        ltc_height: u64,
+        legs: Vec<(u32, u64, String)>,
+    ) -> bool {
+        let legs_json: Vec<serde_json::Value> = legs
+            .into_iter()
+            .map(|(chain_id, height, block_hash)| json!({"chain_id": chain_id, "height": height, "block_hash": block_hash}))
+            .collect();
+        self.publish_json(
+            swarm::TOPIC_SIBLINGS,
+            json!({
+                "type": "sibling",
+                "parent_hash": parent_hash_display,
+                "ltc_height": ltc_height,
+                "legs": legs_json,
+            }),
+        )
+        .await
+    }
 }

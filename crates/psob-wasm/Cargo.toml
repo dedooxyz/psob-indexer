@@ -1,0 +1,20 @@
+[package]
+name = "psob-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# POC: exact-Rust-parity PSob verification compiled to wasm32-unknown-unknown,
+# driven by the SDK's test suite. No wasm-bindgen: plain `extern "C"` ABI
+# (ptr,len) -> (packed ptr<<32|len) over a single static output buffer.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+common = { path = "../common" }
+hex = { workspace = true, default-features = false, features = ["alloc"] }
+
+[dependencies.serde_json]
+version = "1.0"
+default-features = false
+features = ["alloc"]

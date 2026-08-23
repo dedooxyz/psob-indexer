@@ -110,13 +110,46 @@ never vouches for PoW.
 
 ## 6. P2P
 
-Optional libp2p swarm (falls back gracefully if it cannot start):
+Optional libp2p swarm (falls back gracefully if it cannot start). The ingest
+loop publishes verified data — headers on every batch, sibling groups when a
+parent becomes mainnet-shared — through the same typed channel used for
+intents:
 
-| Topic | Payload | Purpose |
+| Topic | Emitted when | Payload |
 |---|---|---|
-| `/psob/headers/v1` | verified aux header | gossip new merge-mined blocks |
-| `/psob/siblings/v1` | shared parent anchor | gossip sibling discoveries |
-| `/psob/intents/v1` | signed swap intent | maker/taker discovery |
+| `/psob/headers/v1` | each ingest batch | batch tip + `auxpow_hex` (self-verifiable) |
+| `/psob/siblings/v1` | parent classified mainnet, ≥2 legs | parent, `ltc_height`, legs |
+| `/psob/intents/v1` | `POST /api/v1/p2p/broadcast` | signed swap intent |
+
+## 6.1 Observability
+
+`GET /metrics` (Prometheus text exposition):
+
+- `http_requests_total{method,route}`, `http_request_seconds{method,route}` —
+  per-route counters and histograms from the axum middleware layer
+  (`MatchedPath` labels, unmatched → raw path).
+- `ingest_blocks_total{chain_id}`, `ingest_ticks_total{chain_id}`,
+  `ingest_errors_total{chain_id}`, `prune_blocks_total{chain_id}`,
+  `parent_resolves_total{state}` — per-chain ingest health.
+- `indexed_blocks{chain_id}`, `chain_cursor{chain_id}`, `sibling_groups`,
+  `indexed_parents` — DB gauges refreshed at scrape time from the L1 cache.
+
+## 6.2 Bounded-window pruning
+
+When `PSOB_MAX_KEPT_BLOCKS` is set, each tick compares the stored minimum
+height against `cursor - max_kept + 1` and issues a range prune
+(`prune_before`) that deletes blocks **and** their sibling-index entries in
+one write transaction (the L1 cache is re-synced afterwards). The cursor is
+never touched; parent classifications outlive the pruned window (they are the
+smallest, most reusable part of the store).
+
+## 6.3 WASM
+
+`crates/psob-wasm` compiles the `common` verification path to
+`wasm32-unknown-unknown` (plain `extern "C"` ABI, no wasm-bindgen CLI) — the
+SDK's test suite drives it against the same live fixture and asserts
+byte-exact agreement with the TS port. Build: `cargo build -p psob-wasm
+--target wasm32-unknown-unknown --release`.
 
 ## 7. API design rules
 

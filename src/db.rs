@@ -118,6 +118,10 @@ impl Page {
 /// Canonical key of a stored aux block.
 type BlockKey = (u32, u64);
 
+/// A block row to prune: its key plus the parent hash of its auxpow (if any)
+/// so the sibling index can be cleaned up in the same transaction.
+type PruneRow = (BlockKey, Option<[u8; 32]>);
+
 /// One row of an epoch query: `(chain_id, aux_height, ltc_height, hash_le)`.
 pub type EpochRow = (u32, u64, u64, [u8; 32]);
 
@@ -523,6 +527,69 @@ impl Database {
         Ok(count)
     }
 
+    // ─── pruning ─────────────────────────────────────────────────────────────
+
+    /// Remove every block of `chain_id` with height < `below` (and its sibling
+    /// index entries). Returns the number of blocks removed. The cursor is
+    /// untouched; only old data drops away (bounded-window deployments).
+    pub fn prune_before(&self, chain_id: u32, below: u64) -> anyhow::Result<u64> {
+        let count = {
+            let write_txn = self.redb.begin_write()?;
+            let n = {
+                let mut table_blocks = write_txn.open_table(TABLE_AUX_BLOCKS)?;
+                let mut table_siblings = write_txn.open_table(TABLE_SIBLING_INDEX)?;
+
+                let removals: Vec<PruneRow> = table_blocks
+                    .range((chain_id, 0)..=(chain_id, below.saturating_sub(1)))?
+                    .map(|item| {
+                        let (k, v) = item?;
+                        let key = (k.value().0, k.value().1);
+                        let parent = bincode::deserialize::<StoredBlock>(v.value())
+                            .ok()
+                            .and_then(|b| b.header.aux.map(|a| sha256d(&a.parent_header)));
+                        Ok((key, parent))
+                    })
+                    .collect::<redb::Result<Vec<_>>>()?;
+
+                for ((c, h), parent) in &removals {
+                    table_blocks.remove((*c, *h))?;
+                    if let Some(p) = parent {
+                        table_siblings.remove((p, *c, *h))?;
+                    }
+                }
+                removals.len() as u64
+            };
+            write_txn.commit()?;
+            n
+        };
+
+        // Memory: collect first, then mutate (DashMap iter/remove don't mix).
+        let mut parents_to_refresh: Vec<[u8; 32]> = Vec::new();
+        let keys: Vec<(u32, u64)> = self
+            .cache_blocks
+            .iter()
+            .filter(|entry| entry.key().0 == chain_id && entry.key().1 < below)
+            .map(|entry| {
+                if let Some(aux) = &entry.value().header.aux {
+                    let p = sha256d(&aux.parent_header);
+                    if !parents_to_refresh.contains(&p) {
+                        parents_to_refresh.push(p);
+                    }
+                }
+                *entry.key()
+            })
+            .collect();
+        for k in keys {
+            self.cache_blocks.remove(&k);
+        }
+        for p in parents_to_refresh {
+            if let Some(mut list) = self.cache_siblings.get_mut(&p) {
+                list.retain(|b| !(b.chain_id == chain_id && b.height < below));
+            }
+        }
+        Ok(count)
+    }
+
     // ─── parents & siblings ──────────────────────────────────────────────────
 
     pub fn get_parent(&self, parent_hash_le: &[u8; 32]) -> anyhow::Result<Option<StoredParent>> {
@@ -905,6 +972,28 @@ mod tests {
         assert_eq!(jkc.blocks, 2);
         assert_eq!(jkc.min_height, Some(1));
         assert_eq!(jkc.max_height, Some(2));
+    }
+
+    #[test]
+    fn prune_before_keeps_bounded_window() {
+        let dir = tempfile_dir();
+        let db = Database::open(&dir).expect("open");
+        for h in 100..=105 {
+            db.insert_block(8224, h, &fixture_block(8224, h, 1))
+                .expect("insert");
+        }
+        // Window of 3: keep heights >= 103.
+        let removed = db.prune_before(8224, 103).expect("prune");
+        assert_eq!(removed, 3);
+        assert!(db.block_at(8224, 102).unwrap().is_none());
+        assert!(db.block_at(8224, 103).unwrap().is_some());
+        assert_eq!(db.chain_block_count(8224).unwrap(), 3);
+        let stats = db.stats().unwrap();
+        let chain = stats.chains.iter().find(|c| c.chain_id == 8224).unwrap();
+        assert_eq!(chain.min_height, Some(103));
+        assert_eq!(chain.max_height, Some(105));
+        // Pruning again is a no-op.
+        assert_eq!(db.prune_before(8224, 103).unwrap(), 0);
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

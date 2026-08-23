@@ -1,0 +1,10 @@
+target/
+.env
+*.redb
+*.sqlite*
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+tests/
+config.example.toml

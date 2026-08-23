@@ -2,7 +2,8 @@
 members = [
     ".",
     "crates/common",
-    "crates/chain-rpc"
+    "crates/chain-rpc",
+    "crates/psob-wasm"
 ]
 resolver = "2"
 
@@ -36,6 +37,7 @@ dotenvy = "0.15"
 toml = "0.8"
 uuid = { version = "1.8", features = ["v4"] }
 fastrand = "2"
+prometheus = "0.13"
 libp2p = { version = "0.54", features = ["macros", "tokio", "gossipsub", "mdns", "noise", "yamux", "tcp", "identify", "ping"] }
 redb = "2.1"
 dashmap = "6.1"

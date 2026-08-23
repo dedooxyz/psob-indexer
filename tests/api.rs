@@ -42,6 +42,7 @@ fn config() -> Config {
         },
         max_batch: 64,
         start_height: Some(1_000_000),
+        max_kept_blocks: None,
         poll_interval: std::time::Duration::from_secs(5),
         retry: psob_indexer::config::RetryConfig {
             max_retries: 1,
@@ -78,7 +79,12 @@ async fn setup() -> (Router, Arc<psob_indexer::db::Database>, Config) {
     db.insert_block(JKC, 101, &jkc2).expect("insert jkc2");
     db.set_cursor_height(JKC, 101).expect("cursor");
 
-    let state = AppState::new(db.clone(), config.clone(), None);
+    let state = AppState::new(
+        db.clone(),
+        config.clone(),
+        None,
+        psob_indexer::metrics::Metrics::new(),
+    );
     (create_router(state), db, config)
 }
 
@@ -261,5 +267,32 @@ async fn openapi_document_is_served() {
     assert!(
         doc["paths"]["/api/v1/siblings"].is_object(),
         "siblings path documented"
+    );
+}
+
+#[tokio::test]
+async fn metrics_are_exposed_and_record_requests() {
+    let (router, _, _) = setup().await;
+    // Hit an API route first so the middleware has something to record.
+    let _ = get(&router, "/api/v1/health").await;
+    let req = Request::builder()
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("psob_indexer_http_requests_total"),
+        "request counter present"
+    );
+    assert!(
+        text.contains("indexed_blocks"),
+        "db gauge refreshed at scrape"
+    );
+    assert!(
+        text.contains("psob_indexer_http_request_seconds"),
+        "latency histogram present"
     );
 }

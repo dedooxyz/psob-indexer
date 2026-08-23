@@ -20,6 +20,12 @@ Base URL: `http://<indexer>:8080`.
 
 ## Endpoints
 
+### GET /metrics
+Prometheus text exposition (always served, `psob_indexer_*` namespace):
+HTTP counters/histograms by route, per-chain ingest counters and gauges
+(`ingest_blocks_total`, `indexed_blocks`, `chain_cursor`), sibling/parent
+gauges, and prune counters. Point a Prometheus scrape job at it.
+
 ### GET /api/v1/health
 Liveness + schema info.
 

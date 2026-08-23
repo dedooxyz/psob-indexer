@@ -21,6 +21,7 @@
 pub mod config;
 pub mod db;
 pub mod ingest;
+pub mod metrics;
 pub mod p2p;
 pub mod resolve;
 pub mod server;

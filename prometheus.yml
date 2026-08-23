@@ -1,0 +1,11 @@
+# Prometheus scrape config for psob-indexer (used by docker-compose.yml).
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: psob-indexer
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["indexer:8080"]
+        labels:
+          service: psob-indexer

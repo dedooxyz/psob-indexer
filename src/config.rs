@@ -76,6 +76,10 @@ pub struct Config {
     pub start_height: Option<u64>,
     /// Poll interval for the continuous loop.
     pub poll_interval: Duration,
+    /// Keep only the most recent N blocks per chain; `None` (default) = keep all.
+    /// Pruning keeps the DB bounded on long-running nodes; old epoch windows
+    /// simply return fewer rows.
+    pub max_kept_blocks: Option<u64>,
     pub retry: RetryConfig,
     pub http: HttpConfig,
     /// Allowed CORS origins (`PSOB_CORS_ORIGINS`, comma-separated; `*` = all).
@@ -96,6 +100,7 @@ struct ConfigFile {
     max_batch: Option<u64>,
     start_height: Option<u64>,
     poll_interval_secs: Option<u64>,
+    max_kept_blocks: Option<u64>,
     retry: RetryFile,
     http: HttpFile,
     cors_origins: Option<String>,
@@ -188,6 +193,9 @@ impl Config {
         let poll_interval = env_num("PSOB_POLL_INTERVAL_SECS")?
             .or_else(|| file.as_ref().and_then(|f| f.poll_interval_secs))
             .unwrap_or(30);
+        let max_kept_blocks = env_num("PSOB_MAX_KEPT_BLOCKS")?
+            .or_else(|| file.as_ref().and_then(|f| f.max_kept_blocks))
+            .filter(|v| *v > 0);
 
         let max_retries = env_num("PSOB_MAX_RETRIES")?
             .or_else(|| file.as_ref().and_then(|f| f.retry.max_retries))
@@ -248,6 +256,7 @@ impl Config {
             max_batch: max_batch.max(1),
             start_height,
             poll_interval: Duration::from_secs(poll_interval.max(1)),
+            max_kept_blocks,
             retry: RetryConfig {
                 max_retries,
                 base_backoff: Duration::from_millis(base_backoff),

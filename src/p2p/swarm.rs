@@ -12,7 +12,7 @@ use libp2p::{
 };
 use tokio::sync::{mpsc, RwLock};
 
-use super::{P2pConfig, P2pHandle, P2pStatus, SwapIntentMessage};
+use super::{GossipMessage, P2pConfig, P2pHandle, P2pStatus};
 
 pub const TOPIC_HEADERS: &str = "/psob/headers/v1";
 pub const TOPIC_SIBLINGS: &str = "/psob/siblings/v1";
@@ -118,15 +118,15 @@ pub async fn start_p2p_swarm(
         ],
     }));
 
-    let (tx_intent, rx_intent) = mpsc::channel::<SwapIntentMessage>(100);
+    let (tx_gossip, rx_gossip) = mpsc::channel::<GossipMessage>(1000);
 
     let handle = P2pHandle {
-        tx_intent,
+        tx_gossip,
         status: Arc::clone(&status),
     };
 
     let swarm_task = async move {
-        run_swarm_loop(swarm, status, rx_intent, topic_intents).await;
+        run_swarm_loop(swarm, status, rx_gossip).await;
     };
 
     Ok((handle, swarm_task))
@@ -135,19 +135,15 @@ pub async fn start_p2p_swarm(
 async fn run_swarm_loop(
     mut swarm: Swarm<AppBehaviour>,
     status: Arc<RwLock<P2pStatus>>,
-    mut rx_intent: mpsc::Receiver<SwapIntentMessage>,
-    topic_intents: gossipsub::IdentTopic,
+    mut rx_gossip: mpsc::Receiver<GossipMessage>,
 ) {
     loop {
         tokio::select! {
-            // Handle outbound intent message to gossip
-            Some(intent) = rx_intent.recv() => {
-                if let Ok(payload) = serde_json::to_vec(&intent) {
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic_intents.clone(), payload) {
-                        tracing::warn!("failed to gossip swap intent: {e}");
-                    } else {
-                        tracing::info!(intent_id = %intent.intent_id, "gossiped swap intent to p2p swarm");
-                    }
+            // Publish queued gossip messages on their topics.
+            Some(msg) = rx_gossip.recv() => {
+                let topic = gossipsub::IdentTopic::new(&msg.topic);
+                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, msg.payload) {
+                    tracing::warn!(topic = %msg.topic, "failed to publish gossip: {e}");
                 }
             }
             // Handle inbound swarm events
