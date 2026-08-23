@@ -26,113 +26,61 @@ use sha2::{Digest, Sha256};
 
 const HEADER_LEN: usize = 80;
 
-// ─── AuxPoW (merged-mining) parsing ─────────────────────────────────────────────
-// `/block/<hash>/header` returns the 80-byte coin header followed by the AuxPoW
-// (CAuxPow) serialization. We parse it into a `common::AuxPow` witness so the PoW
-// can be verified against the scrypt-mined parent block.
-
-struct Cursor<'a> {
-    b: &'a [u8],
-    p: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn at(b: &'a [u8], p: usize) -> Self {
-        Cursor { b, p }
-    }
-    fn take(&mut self, n: usize) -> anyhow::Result<&'a [u8]> {
-        let end = self.p.checked_add(n).ok_or_else(|| anyhow::anyhow!("overflow"))?;
-        if end > self.b.len() {
-            anyhow::bail!("auxpow truncated at {}..{} of {}", self.p, end, self.b.len());
-        }
-        let s = &self.b[self.p..end];
-        self.p = end;
-        Ok(s)
-    }
-    fn u32_le(&mut self) -> anyhow::Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn hash32(&mut self) -> anyhow::Result<[u8; 32]> {
-        let mut h = [0u8; 32];
-        h.copy_from_slice(self.take(32)?);
-        Ok(h)
-    }
-    fn varint(&mut self) -> anyhow::Result<u64> {
-        let n = self.take(1)?[0];
-        Ok(match n {
-            0xff => u64::from_le_bytes(self.take(8)?.try_into().unwrap()),
-            0xfe => u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as u64,
-            0xfd => u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as u64,
-            v => v as u64,
-        })
-    }
-    /// Advance past one legacy (no-witness) transaction; returns its byte range.
-    fn skip_tx(&mut self) -> anyhow::Result<()> {
-        self.take(4)?; // version
-        let nin = self.varint()?;
-        for _ in 0..nin {
-            self.take(36)?; // prevout
-            let sl = self.varint()? as usize;
-            self.take(sl)?; // scriptSig
-            self.take(4)?; // sequence
-        }
-        let nout = self.varint()?;
-        for _ in 0..nout {
-            self.take(8)?; // value
-            let sl = self.varint()? as usize;
-            self.take(sl)?; // scriptPubKey
-        }
-        self.take(4)?; // locktime
-        Ok(())
-    }
-    fn branch(&mut self) -> anyhow::Result<Vec<[u8; 32]>> {
-        let n = self.varint()? as usize;
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.hash32()?);
-        }
-        Ok(out)
-    }
-}
-
 /// Split a full `/block/:hash/header` response (80-byte header ‖ CAuxPow) into the
 /// base header and the parsed [`AuxPow`] witness.
+///
+/// The wire-format decoder lives in [`common::cauxpow`] so the exact byte layout
+/// is shared with the guest and the SDK port; this is a dependency-free re-export.
 pub fn parse_auxpow(full: &[u8]) -> anyhow::Result<([u8; 80], AuxPow)> {
-    if full.len() < HEADER_LEN {
-        anyhow::bail!("header shorter than 80 bytes: {}", full.len());
-    }
-    let mut base = [0u8; 80];
-    base.copy_from_slice(&full[..HEADER_LEN]);
-
-    // CAuxPow = CMerkleTx(coinbase) ‖ chainMerkleBranch ‖ chainIndex ‖ parentHeader.
-    let mut cur = Cursor::at(full, HEADER_LEN);
-    let cb_start = cur.p;
-    cur.skip_tx()?;
-    let coinbase_tx = full[cb_start..cur.p].to_vec();
-    let _parent_block_hash = cur.hash32()?; // CMerkleTx.hashBlock (unused)
-    let parent_merkle_branch = cur.branch()?;
-    let parent_index = cur.u32_le()?;
-    let chain_merkle_branch = cur.branch()?;
-    let chain_index = cur.u32_le()?;
-    let parent_header = cur.take(HEADER_LEN)?.to_vec();
-
-    Ok((
-        base,
-        AuxPow {
-            coinbase_tx,
-            parent_merkle_branch,
-            parent_index,
-            chain_merkle_branch,
-            chain_index,
-            parent_header,
-        },
-    ))
+    Ok(common::cauxpow::parse_auxpow(full)?)
 }
+
+pub use common::cauxpow::{parse_header_with_auxpow, AuxPowParseError};
 
 #[derive(Clone)]
 pub struct ElectrsClient {
     base: String,
     http: reqwest::Client,
+    policy: HttpPolicy,
+    /// Timestamp of the last request start; used to keep a minimum inter-request
+    /// gap so a slow public Electrs endpoint does not rate-limit us to death.
+    last_request: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+/// HTTP policy shared by the Electrs client and the parent resolver.
+#[derive(Debug, Clone)]
+pub struct HttpPolicy {
+    pub timeout: std::time::Duration,
+    pub max_retries: u32,
+    pub base_backoff: std::time::Duration,
+    pub max_backoff: std::time::Duration,
+    pub min_request_interval: std::time::Duration,
+}
+
+impl Default for HttpPolicy {
+    fn default() -> Self {
+        Self {
+            timeout: std::time::Duration::from_secs(30),
+            max_retries: 4,
+            base_backoff: std::time::Duration::from_millis(500),
+            max_backoff: std::time::Duration::from_secs(30),
+            min_request_interval: std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// True when the failure is transient and worth retrying: transport errors,
+/// timeouts, 429 (rate limited), and any 5xx. 4xx are deterministic — no point
+/// hammering a 404 or 400.
+#[allow(dead_code)]
+fn retryable(err: &reqwest::Error, status: reqwest::StatusCode) -> bool {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    if status.is_server_error() {
+        return true;
+    }
+    err.is_connect() || err.is_timeout() || err.is_request()
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +88,114 @@ struct MerkleProofResp {
     block_height: u64,
     merkle: Vec<String>,
     pos: usize,
+}
+
+/// Exponential backoff with full jitter (AWS-style: base * 2^attempt, randomized
+/// to `[0, delay]`), capped at `max_backoff`, then a small constant floor so the
+/// first retry is not instant.
+async fn backoff(policy: &HttpPolicy, attempt: u32) {
+    let exp = policy
+        .base_backoff
+        .saturating_mul(2u32.saturating_pow(attempt.min(10)));
+    let capped = exp.min(policy.max_backoff);
+    let jittered = if capped.is_zero() {
+        std::time::Duration::from_millis(50)
+    } else {
+        std::time::Duration::from_millis(fastrand::u64(0..capped.as_millis() as u64 + 1))
+    };
+    tokio::time::sleep(jittered).await;
+}
+
+impl ElectrsClient {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_policy(base_url, HttpPolicy::default())
+    }
+
+    pub fn with_policy(base_url: impl Into<String>, policy: HttpPolicy) -> Self {
+        // No timeout on `reqwest::Client::new()` means a TCP-connected-but-silent
+        // server (junk-api has shown this failure mode live) hangs the call
+        // forever with no Err — the reason a per-request timeout policy pin exists.
+        let http = reqwest::Client::builder()
+            .timeout(policy.timeout)
+            .build()
+            .expect("reqwest client builder with only a timeout cannot fail");
+        Self {
+            base: base_url.into().trim_end_matches('/').to_string(),
+            http,
+            policy,
+            last_request: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// GET a path with rate-limit pacing, retry/backoff, and polite errors.
+    /// Returns the `Response` (caller decides what counts as success).
+    async fn get_raw(&self, path: &str) -> anyhow::Result<reqwest::Response> {
+        let url = format!("{}{}", self.base, path);
+
+        // Rate limit: enforce the minimum gap between requests to this host.
+        if !self.policy.min_request_interval.is_zero() {
+            let wait = {
+                let mut slot = self
+                    .last_request
+                    .lock()
+                    .expect("last_request mutex poisoned");
+                let deadline = slot
+                    .as_ref()
+                    .map(|i| *i + self.policy.min_request_interval)
+                    .unwrap_or(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                *slot = Some(now);
+                (now < deadline).then_some(deadline - now)
+            };
+            if let Some(wait) = wait {
+                tokio::time::sleep(wait).await;
+            }
+        }
+
+        let mut attempt = 0u32;
+        loop {
+            match self.http.get(&url).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let transient = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error();
+                    if transient && attempt < self.policy.max_retries {
+                        tracing::debug!(url = %url, status = %status, attempt, "transient HTTP error, retrying");
+                        backoff(&self.policy, attempt).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let transient = e.is_connect() || e.is_timeout() || e.is_request();
+                    if transient && attempt < self.policy.max_retries {
+                        tracing::debug!(url = %url, err = %e, attempt, "transport error, retrying");
+                        backoff(&self.policy, attempt).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("GET {url}: {e}"));
+                }
+            }
+        }
+    }
+
+    async fn get_text(&self, path: &str) -> anyhow::Result<String> {
+        let resp = self.get_raw(path).await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("GET {path}: HTTP {}", resp.status());
+        }
+        Ok(resp.text().await?)
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let resp = self.get_raw(path).await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("GET {path}: HTTP {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
 }
 
 /// Esplora tx confirmation status (subset).
@@ -202,7 +258,7 @@ fn rev32(mut b: [u8; 32]) -> [u8; 32] {
 }
 
 /// Display (big-endian) hex of a consensus little-endian hash.
-fn hash_display(le: &[u8; 32]) -> String {
+pub fn hash_display(le: &[u8; 32]) -> String {
     let mut b = *le;
     b.reverse();
     hex::encode(b)
@@ -219,37 +275,17 @@ fn hex32(display_hex: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 impl ElectrsClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        // No timeout on `reqwest::Client::new()` means a TCP-connected-but-silent
-        // server (junk-api has shown this failure mode live) hangs the call
-        // forever with no Err — see the matching fix in mpc-node/src/electrs.rs.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("reqwest client builder with only a timeout cannot fail");
-        Self {
-            base: base_url.into().trim_end_matches('/').to_string(),
-            http,
-        }
-    }
-
-    async fn get_text(&self, path: &str) -> anyhow::Result<String> {
-        let url = format!("{}{}", self.base, path);
-        Ok(self.http.get(&url).send().await?.error_for_status()?.text().await?)
-    }
-
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
-        let url = format!("{}{}", self.base, path);
-        Ok(self.http.get(&url).send().await?.error_for_status()?.json::<T>().await?)
-    }
-
     pub async fn tip_height(&self) -> anyhow::Result<u64> {
         Ok(self.get_text("/blocks/tip/height").await?.trim().parse()?)
     }
 
     /// Block hash (display hex) at `height`.
     pub async fn block_hash_at(&self, height: u64) -> anyhow::Result<String> {
-        Ok(self.get_text(&format!("/block-height/{height}")).await?.trim().to_string())
+        Ok(self
+            .get_text(&format!("/block-height/{height}"))
+            .await?
+            .trim()
+            .to_string())
     }
 
     /// Block height for a block hash (display hex). Reverse of [`block_hash_at`].
@@ -265,7 +301,11 @@ impl ElectrsClient {
     /// The raw 80-byte consensus header for `block_hash` (AuxPoW data, if any, is
     /// dropped — see the module note).
     pub async fn header_80(&self, block_hash: &str) -> anyhow::Result<[u8; 80]> {
-        let raw = hex::decode(self.get_text(&format!("/block/{block_hash}/header")).await?.trim())?;
+        let raw = hex::decode(
+            self.get_text(&format!("/block/{block_hash}/header"))
+                .await?
+                .trim(),
+        )?;
         if raw.len() < HEADER_LEN {
             anyhow::bail!("header shorter than 80 bytes: {}", raw.len());
         }
@@ -275,24 +315,47 @@ impl ElectrsClient {
     }
 
     pub async fn tx_bytes(&self, txid_display: &str) -> anyhow::Result<Vec<u8>> {
-        Ok(hex::decode(self.get_text(&format!("/tx/{txid_display}/hex")).await?.trim())?)
+        Ok(hex::decode(
+            self.get_text(&format!("/tx/{txid_display}/hex"))
+                .await?
+                .trim(),
+        )?)
     }
 
     /// The base 80-byte header plus its parsed AuxPoW witness for `block_hash`.
     pub async fn header_with_auxpow(&self, block_hash: &str) -> anyhow::Result<([u8; 80], AuxPow)> {
-        let raw = hex::decode(self.get_text(&format!("/block/{block_hash}/header")).await?.trim())?;
+        let raw = self.header_wire(block_hash).await?;
         parse_auxpow(&raw)
     }
 
+    /// The raw wire payload for `block_hash`: 80-byte header ‖ CAuxPow. This is
+    /// the self-verifiable blob the indexer keeps verbatim.
+    pub async fn header_wire(&self, block_hash: &str) -> anyhow::Result<Vec<u8>> {
+        let raw = hex::decode(
+            self.get_text(&format!("/block/{block_hash}/header"))
+                .await?
+                .trim(),
+        )?;
+        if raw.len() < HEADER_LEN {
+            anyhow::bail!("header shorter than 80 bytes: {}", raw.len());
+        }
+        Ok(raw)
+    }
+
     async fn merkle_proof(&self, txid_display: &str) -> anyhow::Result<MerkleProofResp> {
-        self.get_json(&format!("/tx/{txid_display}/merkle-proof")).await
+        self.get_json(&format!("/tx/{txid_display}/merkle-proof"))
+            .await
     }
 
     /// Confirmed txs for `address`, most-recent first (`/address/:addr/txs/chain`).
     /// Esplora returns up to 25 per page; `last_seen` continues after that txid. A
     /// fresh peg-out payout is among the most recent, so the first page normally
     /// suffices for [`find_payout`], which paginates a bounded number of pages.
-    pub async fn address_txs_chain(&self, address: &str, last_seen: Option<&str>) -> anyhow::Result<Vec<AddrTx>> {
+    pub async fn address_txs_chain(
+        &self,
+        address: &str,
+        last_seen: Option<&str>,
+    ) -> anyhow::Result<Vec<AddrTx>> {
         let path = match last_seen {
             Some(txid) => format!("/address/{address}/txs/chain/{txid}"),
             None => format!("/address/{address}/txs/chain"),
@@ -323,7 +386,9 @@ impl ElectrsClient {
         let mut last_seen: Option<String> = None;
         let mut payouts = Vec::new();
         for _ in 0..max_pages.max(1) {
-            let page = self.address_txs_chain(recipient_address, last_seen.as_deref()).await?;
+            let page = self
+                .address_txs_chain(recipient_address, last_seen.as_deref())
+                .await?;
             if page.is_empty() {
                 break;
             }
@@ -360,9 +425,7 @@ impl ElectrsClient {
     /// Check if a transaction spends at least one input from `address`.
     /// Fetches `/tx/:txid` from electrs and inspects `vin[].prevout.scriptpubkey_address`.
     async fn tx_spends_from(&self, txid_display: &str, address: &str) -> anyhow::Result<bool> {
-        let tx_info: serde_json::Value = self
-            .get_json(&format!("/tx/{txid_display}"))
-            .await?;
+        let tx_info: serde_json::Value = self.get_json(&format!("/tx/{txid_display}")).await?;
         let vin = tx_info.get("vin").and_then(|v| v.as_array());
         match vin {
             Some(vin) => {
@@ -393,10 +456,11 @@ async fn jkc_header_with_auxpow(client: &ElectrsClient, hash: &str) -> anyhow::R
             "block {hash} has no parseable AuxPoW witness (PSob requires merge-mined blocks): {e}"
         )
     })?;
-    Ok(BlockHeader { raw: raw.to_vec(), aux: Some(aux) })
+    Ok(BlockHeader {
+        raw: raw.to_vec(),
+        aux: Some(aux),
+    })
 }
-
-
 
 /// Assemble the [`ProofInput`] witness for a deposit. `deposit_txid_display` is the
 /// usual big-endian txid string.
@@ -408,7 +472,10 @@ pub async fn build_proof_input(
     let mp = client.merkle_proof(deposit_txid_display).await?;
     let dep_height = mp.block_height;
     if dep_height <= cp.checkpoint_height {
-        anyhow::bail!("deposit height {dep_height} is not above the checkpoint {}", cp.checkpoint_height);
+        anyhow::bail!(
+            "deposit height {dep_height} is not above the checkpoint {}",
+            cp.checkpoint_height
+        );
     }
 
     // Window: checkpoint+1 ..= deposit + (min_confirmations - 1), giving exactly
@@ -538,7 +605,10 @@ mod tests {
         tx.extend_from_slice(&0u32.to_le_bytes());
 
         // Matches: correct recipient + wid.
-        assert_eq!(common::parse_withdrawal_outputs(&tx, &recipient), Some((450_000_000, wid)));
+        assert_eq!(
+            common::parse_withdrawal_outputs(&tx, &recipient),
+            Some((450_000_000, wid))
+        );
         // Non-match: a different recipient is not paid by this tx.
         assert_eq!(common::parse_withdrawal_outputs(&tx, &[0x77u8; 20]), None);
     }
@@ -608,10 +678,18 @@ mod tests {
 
         // (c): merkle path folds to the deposit header's root.
         let dep_hdr = &input.headers[input.deposit_header_index as usize];
-        assert_eq!(fold_merkle(&input.merkle_proof), merkle_root_of(dep_hdr), "merkle inclusion");
+        assert_eq!(
+            fold_merkle(&input.merkle_proof),
+            merkle_root_of(dep_hdr),
+            "merkle inclusion"
+        );
 
         // deposit tx hashes to the proven txid.
-        assert_eq!(sha256d(&input.deposit_tx), input.merkle_proof.txid, "tx ↔ txid");
+        assert_eq!(
+            sha256d(&input.deposit_tx),
+            input.merkle_proof.txid,
+            "tx ↔ txid"
+        );
     }
 
     fn target_from_bits(bits: u32) -> [u8; 32] {
@@ -667,7 +745,11 @@ mod tests {
 
         let (base, aux) = c.header_with_auxpow(&hash).await.unwrap();
         let aux_block_hash = sha256d(&base);
-        assert_eq!(aux_block_hash[..], rev32(hex32(&hash).unwrap())[..], "block id");
+        assert_eq!(
+            aux_block_hash[..],
+            rev32(hex32(&hash).unwrap())[..],
+            "block id"
+        );
 
         // chain_id = coin header nVersion >> 16.
         let chain_id = u32::from_le_bytes(base[0..4].try_into().unwrap()) >> 16;
@@ -679,6 +761,9 @@ mod tests {
         let bits = u32::from_le_bytes(base[72..76].try_into().unwrap());
         let target = target_from_bits(bits);
         let pow = scrypt_pow(&aux.parent_header);
-        assert!(meets_target(&pow, &target), "parent scrypt PoW must meet the target");
+        assert!(
+            meets_target(&pow, &target),
+            "parent scrypt PoW must meet the target"
+        );
     }
 }

@@ -20,28 +20,33 @@ pub struct P2pConfig {
     pub enable_mdns: bool,
 }
 
+impl P2pConfig {
+    /// Build from explicit values (`None` = defaults). Env/TOML resolution lives
+    /// in [`crate::config::Config::load`] — reading the process env from deep
+    /// inside a module was why config was hard to reason about before.
+    pub fn from_parts(
+        port: Option<u16>,
+        bind: Option<String>,
+        bootstrap_nodes: Option<String>,
+        disable_mdns: Option<String>,
+    ) -> Self {
+        Self {
+            p2p_port: port.unwrap_or(9000),
+            p2p_bind_addr: bind.unwrap_or_else(|| "0.0.0.0".to_string()),
+            bootstrap_nodes: bootstrap_nodes
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .collect(),
+            enable_mdns: disable_mdns.is_none(),
+        }
+    }
+}
+
 impl Default for P2pConfig {
     fn default() -> Self {
-        let p2p_port = std::env::var("PSOB_P2P_PORT")
-            .ok()
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(9000);
-        let p2p_bind_addr = std::env::var("PSOB_P2P_BIND")
-            .unwrap_or_else(|_| "0.0.0.0".to_string());
-        let bootstrap_nodes = std::env::var("PSOB_BOOTSTRAP_NODES")
-            .unwrap_or_default()
-            .split(',')
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string())
-            .collect();
-        let enable_mdns = std::env::var("PSOB_DISABLE_MDNS").is_err();
-
-        Self {
-            p2p_port,
-            p2p_bind_addr,
-            bootstrap_nodes,
-            enable_mdns,
-        }
+        Self::from_parts(None, None, None, None)
     }
 }
 

@@ -24,6 +24,7 @@ pub mod ingest;
 pub mod p2p;
 pub mod resolve;
 pub mod server;
+pub mod verify;
 
-pub use config::Config;
+pub use config::{AuxChain, Config};
 pub use db::{Database, SharedParent, StoredBlock, StoredParent};

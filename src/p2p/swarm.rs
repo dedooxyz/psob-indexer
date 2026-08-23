@@ -7,10 +7,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use libp2p::{
-    futures::StreamExt,
-    gossipsub, identify, mdns, noise, ping,
-    swarm::SwarmEvent,
-    tcp, yamux, Multiaddr, Swarm,
+    futures::StreamExt, gossipsub, identify, mdns, noise, ping, swarm::SwarmEvent, tcp, yamux,
+    Multiaddr, Swarm,
 };
 use tokio::sync::{mpsc, RwLock};
 
@@ -28,7 +26,9 @@ pub struct AppBehaviour {
     pub ping: ping::Behaviour,
 }
 
-pub async fn start_p2p_swarm(config: P2pConfig) -> anyhow::Result<(P2pHandle, impl std::future::Future<Output = ()>)> {
+pub async fn start_p2p_swarm(
+    config: P2pConfig,
+) -> anyhow::Result<(P2pHandle, impl std::future::Future<Output = ()>)> {
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -48,16 +48,21 @@ pub async fn start_p2p_swarm(config: P2pConfig) -> anyhow::Result<(P2pHandle, im
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .message_id_fn(message_id_fn)
                 .build()
-                .map_err(|msg| Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg)) as Box<dyn std::error::Error + Send + Sync>)?;
+                .map_err(|msg| {
+                    Box::new(std::io::Error::other(msg)) as Box<dyn std::error::Error + Send + Sync>
+                })?;
 
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
             )
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(|e| {
+                Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let mdns =
+                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
             let identify = identify::Behaviour::new(identify::Config::new(
                 "/psob/1.0.0".to_string(),

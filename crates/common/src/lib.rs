@@ -10,6 +10,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
+pub mod cauxpow;
+
 /// Scrypt parameters for the Junkcoin/Litecoin PoW hash.
 pub const SCRYPT_LOG_N: u8 = 10; // N = 1024
 pub const SCRYPT_R: u32 = 1;
@@ -41,7 +43,8 @@ pub const AUXPOW_MAGIC: [u8; 4] = [0xfa, 0xbe, 0x6d, 0x6d];
 // and the parent header satisfies the PoW target. Verifying a JKC block's PoW means
 // verifying this AuxPoW linkage + the parent's scrypt PoW. See `verify_auxpow_commitment`.
 
-fn sha256d(data: &[u8]) -> [u8; 32] {
+/// Double-SHA256 — the block/tx hash function of the scrypt/AuxPoW family.
+pub fn sha256d(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let first = Sha256::digest(data);
     let second = Sha256::digest(first);
@@ -300,7 +303,6 @@ pub struct ProofInput {
     /// family this is [`CHAIN_POW_LIMIT_BITS`] == [`LTC_POW_LIMIT_BITS`].
     pub pow_limit_bits: u32,
 }
-
 
 /// Solidity head-ABI word: a value right-aligned in 32 bytes.
 fn word_from_be(bytes: &[u8]) -> [u8; 32] {
@@ -665,7 +667,7 @@ pub fn target_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 // ─── PSob (Proof-of-Sibling) chain verification ────────────────────────────────
 // The Proof-of-Sibling technique proves that a JKC block is a "sibling" committed
-// within the coinbase of an AuxPoW parent block. This function verifies the JKC 
+// within the coinbase of an AuxPoW parent block. This function verifies the JKC
 // chain linkages and the AuxPoW commitments for every header.
 //
 // The caller (guest) is responsible for then running `scrypt` on the parent block
@@ -710,7 +712,10 @@ pub fn verify_psob_chain(
             return Err("target easier than powLimit");
         }
         let id = sha256d(&header.raw);
-        let aux = header.aux.as_ref().ok_or("auxpow witness required for PoW")?;
+        let aux = header
+            .aux
+            .as_ref()
+            .ok_or("auxpow witness required for PoW")?;
         if !verify_auxpow_commitment(&id, aux, chain_id) {
             return Err("auxpow commitment invalid");
         }
@@ -854,7 +859,10 @@ pub fn parse_deposit_outputs(tx: &[u8], custody_hash160: &[u8; 20]) -> Option<(u
 /// `recipient_hash160` P2PKH, and at least one *output* is `OP_RETURN <32-byte withdrawalId>`
 /// (`6a 20 <32>`). The first qualifying payout and the first OP_RETURN binding are taken.
 /// Only OUTPUT scriptPubKeys are inspected; input scriptSigs cannot forge a payout.
-pub fn parse_withdrawal_outputs(tx: &[u8], recipient_hash160: &[u8; 20]) -> Option<(u64, [u8; 32])> {
+pub fn parse_withdrawal_outputs(
+    tx: &[u8],
+    recipient_hash160: &[u8; 20],
+) -> Option<(u64, [u8; 32])> {
     let mut p = 4usize; // skip version
     if p > tx.len() {
         return None;
@@ -901,7 +909,11 @@ pub fn parse_withdrawal_outputs(tx: &[u8], recipient_hash160: &[u8; 20]) -> Opti
             && &script[3..23] == recipient_hash160
         {
             payout = Some(value);
-        } else if withdrawal_id.is_none() && script.len() == 34 && script[0] == 0x6a && script[1] == 0x20 {
+        } else if withdrawal_id.is_none()
+            && script.len() == 34
+            && script[0] == 0x6a
+            && script[1] == 0x20
+        {
             let mut w = [0u8; 32];
             w.copy_from_slice(&script[2..34]);
             withdrawal_id = Some(w);
@@ -970,7 +982,7 @@ mod tests {
 
     #[test]
     fn journal_abi_encode_layout() {
-        // 13 static words / 416 bytes, fixed layout (no tail).
+        // 11 static words / 352 bytes, fixed layout (no tail).
         let j = Journal {
             deposit_block_hash: [0x11; 32],
             deposit_txid: [0x22; 32],
@@ -983,11 +995,9 @@ mod tests {
             custody_hash160: [0x55; 20],
             custody_epoch: 3,
             chain_id: 0x2020,
-            ltc_checkpoint_hash: [0x66; 32],
-            ltc_tip_hash: [0x77; 32],
         };
         let enc = j.abi_encode();
-        assert_eq!(enc.len(), 416);
+        assert_eq!(enc.len(), 352);
         assert_eq!(&enc[..32], &[0x11u8; 32]);
         assert_eq!(&enc[32..64], &[0x22u8; 32]);
         // uint64 amountSats, right-aligned
@@ -1013,8 +1023,6 @@ mod tests {
         // uint32 chainId, left-padded
         assert_eq!(&enc[320..348], &[0u8; 28]);
         assert_eq!(&enc[348..352], &0x2020u32.to_be_bytes());
-        assert_eq!(&enc[352..384], &[0x66u8; 32]);
-        assert_eq!(&enc[384..416], &[0x77u8; 32]);
     }
 
     // ─── PoW target expansion / range check ───────────────────────────────────
@@ -1124,7 +1132,7 @@ mod tests {
         payload.extend_from_slice(&999_000_000u64.to_le_bytes()); // attacker "amount"
         payload.push(0x19); // scriptLen the old scanner keyed on
         payload.extend_from_slice(&p2pkh_spk(&custody)); // fake custody script
-        // OP_RETURN with a 1-byte-pushdata-76 carrying the payload (len > 75 ⇒ 0x4c).
+                                                         // OP_RETURN with a 1-byte-pushdata-76 carrying the payload (len > 75 ⇒ 0x4c).
         let mut opret = alloc::vec![0x6au8, 0x4c, payload.len() as u8];
         opret.extend_from_slice(&payload);
         // plus a real recipient OP_RETURN, and the attacker pays themselves dust.
@@ -1196,9 +1204,9 @@ mod tests {
         let recipient = [0x33u8; 20];
         let wid = [0x44u8; 32];
         let tx = build_tx(&[
-            (450_000_000, p2pkh_spk(&recipient)),  // payout to user
-            (0, op_return32(&wid)),                // withdrawalId binding
-            (10_000_000, p2pkh_spk(&[0x99u8; 20])),// change back to custody
+            (450_000_000, p2pkh_spk(&recipient)),   // payout to user
+            (0, op_return32(&wid)),                 // withdrawalId binding
+            (10_000_000, p2pkh_spk(&[0x99u8; 20])), // change back to custody
         ]);
         let (payout, got) = parse_withdrawal_outputs(&tx, &recipient).expect("parses");
         assert_eq!(payout, 450_000_000);
@@ -1212,7 +1220,10 @@ mod tests {
         let tx = build_tx(&[(450_000_000, p2pkh_spk(&recipient))]);
         assert_eq!(parse_withdrawal_outputs(&tx, &recipient), None);
         // pays a different recipient (no payout to ours)
-        let tx2 = build_tx(&[(450_000_000, p2pkh_spk(&[0x77u8; 20])), (0, op_return32(&[0x44u8; 32]))]);
+        let tx2 = build_tx(&[
+            (450_000_000, p2pkh_spk(&[0x77u8; 20])),
+            (0, op_return32(&[0x44u8; 32])),
+        ]);
         assert_eq!(parse_withdrawal_outputs(&tx2, &recipient), None);
     }
 
@@ -1227,11 +1238,9 @@ mod tests {
             pow_limit_bits: 0x1e0f_ffff,
             proven_work: [0x44; 32],
             chain_id: 0x2020,
-            ltc_checkpoint_hash: [0x55; 32],
-            ltc_tip_hash: [0x66; 32],
         };
         let enc = j.abi_encode();
-        assert_eq!(enc.len(), 320);
+        assert_eq!(enc.len(), 256);
         assert_eq!(&enc[0..32], &[0x11u8; 32]);
         assert_eq!(&enc[32..52], &[0xabu8; 20]); // bytes20 LEFT-aligned
         assert_eq!(&enc[52..64], &[0u8; 12]);
@@ -1243,8 +1252,6 @@ mod tests {
         // uint32 chainId, left-padded
         assert_eq!(&enc[224..252], &[0u8; 28]);
         assert_eq!(&enc[252..256], &0x2020u32.to_be_bytes());
-        assert_eq!(&enc[256..288], &[0x55u8; 32]);
-        assert_eq!(&enc[288..320], &[0x66u8; 32]);
         assert_eq!(WithdrawalJournal::abi_decode(&enc).unwrap(), j);
     }
 
@@ -1255,7 +1262,7 @@ mod tests {
         let chain_id = 0x2020u32;
         let nonce = 0x1234_5678u32;
         let height = 3usize; // 3-deep chain tree ⇒ size 8
-        // The chain_index is PINNED by (nonce, chain_id, height) — derive it.
+                             // The chain_index is PINNED by (nonce, chain_id, height) — derive it.
         let chain_index = get_expected_index(nonce, chain_id, height as u32);
 
         let chain_branch = alloc::vec![[0x22u8; 32], [0x23u8; 32], [0x24u8; 32]];
@@ -1303,7 +1310,11 @@ mod tests {
         // (a chain may not merge-mine itself). Set parent version = chain_id << 16.
         let mut self_mined = aux.clone();
         self_mined.parent_header[0..4].copy_from_slice(&(chain_id << 16).to_le_bytes());
-        assert!(!verify_auxpow_commitment(&aux_block_hash, &self_mined, chain_id));
+        assert!(!verify_auxpow_commitment(
+            &aux_block_hash,
+            &self_mined,
+            chain_id
+        ));
         let _ = &coinbase;
     }
 
@@ -1322,8 +1333,6 @@ mod tests {
             custody_hash160: [0x55; 20],
             custody_epoch: 1,
             chain_id: 0x2020,
-            ltc_checkpoint_hash: [0x56; 32],
-            ltc_tip_hash: [0x57; 32],
         };
         let enc = j.abi_encode();
         let decoded = Journal::abi_decode(&enc).unwrap();
@@ -1332,28 +1341,27 @@ mod tests {
 
     #[test]
     fn journal_abi_decode_rejects_bad_length() {
-        assert!(Journal::abi_decode(&[0u8; 415]).is_err());
-        assert!(Journal::abi_decode(&[0u8; 417]).is_err());
-        assert!(Journal::abi_decode(&[0u8; 416]).is_ok());
+        assert!(Journal::abi_decode(&[0u8; 351]).is_err());
+        assert!(Journal::abi_decode(&[0u8; 353]).is_err());
+        assert!(Journal::abi_decode(&[0u8; 352]).is_ok());
     }
 
     // ─── PSob chain verification tests ───────────────────────────────────────
-    /// Build a self-consistent PSob witness: `n` JKC headers chained from the JKC
-    /// checkpoint, each committed by a coinbase in its own LTC parent; the LTC
-    /// parents chained from `ltc_checkpoint_hash` with a gap-filler inserted
-    /// between parent 0 and parent 1 (so the chain is longer than the parents).
-    fn psob_fixture(n: usize) -> (alloc::vec::Vec<BlockHeader>, alloc::vec::Vec<BlockHeader>, [u8; 32], [u8; 32]) {
+    /// Build a self-consistent PSob witness: `n` aux headers chained from
+    /// `checkpoint`, each committed by a coinbase in its own foreign parent header.
+    /// The commitment uses a chain branch of the given depth with the anti-grind
+    /// slot derived from the (nonce, chain_id, depth) triple — exactly what
+    /// `verify_psob_chain` checks (linkage, chain id, nBits range, commitment).
+    fn psob_fixture(n: usize, depth: usize) -> (alloc::vec::Vec<BlockHeader>, [u8; 32], u32) {
         let chain_id = 0x2020u32;
         let bits = CHAIN_POW_LIMIT_BITS;
         let checkpoint = [0x33u8; 32];
-        let ltc_checkpoint = [0x44u8; 32];
 
         let mut headers = alloc::vec::Vec::new();
-        let mut parents = alloc::vec::Vec::new();
         let mut prev = checkpoint;
-        let mut ltc_prev = ltc_checkpoint;
+        let mut nonce = 0x1234_5678u32;
 
-        for i in 0..n {
+        for _ in 0..n {
             let mut hdr = alloc::vec![0u8; 80];
             hdr[0..4].copy_from_slice(&((chain_id << 16) | 1).to_le_bytes());
             hdr[4..36].copy_from_slice(&prev);
@@ -1361,29 +1369,29 @@ mod tests {
             hdr[72..76].copy_from_slice(&bits.to_le_bytes());
             let id = sha256d(&hdr);
 
-            // LTC parent commits this JKC block in its coinbase.
-            let mut committed = id;
+            // Chain branch of `depth` dummy siblings; slot pinned by anti-grind.
+            let mut chain_branch = alloc::vec::Vec::new();
+            for k in 0..depth {
+                chain_branch.push([0x40 + k as u8; 32]);
+            }
+            nonce = nonce.wrapping_mul(1103515245).wrapping_add(12345);
+            let chain_index = get_expected_index(nonce, chain_id, depth as u32);
+            let chain_root = merkle_fold_branch(&id, &chain_branch, chain_index);
+            let mut committed = chain_root;
             committed.reverse();
+
+            // coinbase: prefix ‖ magic ‖ root ‖ size(=2^depth) ‖ nonce ‖ tail
             let mut coinbase = alloc::vec![0xde, 0xad];
             coinbase.extend_from_slice(&AUXPOW_MAGIC);
             coinbase.extend_from_slice(&committed);
-            coinbase.extend_from_slice(&1u32.to_le_bytes()); // size = 2^0
-            coinbase.extend_from_slice(&0u32.to_le_bytes()); // nonce
+            coinbase.extend_from_slice(&(1u32 << depth).to_le_bytes());
+            coinbase.extend_from_slice(&nonce.to_le_bytes());
             coinbase.push(0xcc);
             let cb_txid = sha256d(&coinbase);
 
-            if i == 1 {
-                // gap-filler LTC block between parent 0 and parent 1
-                let mut filler = alloc::vec![0u8; 80];
-                filler[4..36].copy_from_slice(&ltc_prev);
-                filler[72..76].copy_from_slice(&bits.to_le_bytes());
-                ltc_prev = sha256d(&filler);
-                parents.push(BlockHeader { raw: filler, aux: None });
-            }
-
             let mut parent = alloc::vec![0u8; 80];
-            parent[4..36].copy_from_slice(&ltc_prev);
-            parent[36..68].copy_from_slice(&cb_txid);
+            parent[4..36].copy_from_slice(&[0x55; 32]); // arbitrary foreign chain link
+            parent[36..68].copy_from_slice(&cb_txid); // coinbase IS the merkle root
             parent[72..76].copy_from_slice(&bits.to_le_bytes());
 
             headers.push(BlockHeader {
@@ -1392,71 +1400,78 @@ mod tests {
                     coinbase_tx: coinbase,
                     parent_merkle_branch: alloc::vec![],
                     parent_index: 0,
-                    chain_merkle_branch: alloc::vec![],
-                    chain_index: 0,
-                    parent_header: parent.clone(),
+                    chain_merkle_branch: chain_branch,
+                    chain_index,
+                    parent_header: parent,
                 }),
             });
-            parents.push(BlockHeader { raw: parent, aux: None });
             prev = id;
-            ltc_prev = sha256d(&parents.last().unwrap().raw);
         }
-        (headers, parents, checkpoint, ltc_checkpoint)
+        (headers, checkpoint, chain_id)
     }
 
     #[test]
-    fn psob_chain_verifies_with_gap_filler() {
-        let (headers, parents, checkpoint, ltc_checkpoint) = psob_fixture(3);
-        let out = verify_psob_chain(&headers, &checkpoint, &parents, &ltc_checkpoint, 0x2020, CHAIN_POW_LIMIT_BITS)
-            .expect("valid PSob chain");
-        let tip_target = expand_target(CHAIN_POW_LIMIT_BITS).unwrap();
-        assert_eq!(out.ltc_tip_hash, sha256d(&parents.last().unwrap().raw));
-        assert_eq!(out.ltc_tip_target, tip_target);
-        assert_eq!(out.proven_work, block_work(&tip_target));
+    fn psob_chain_verifies_valid_witness() {
+        let (headers, checkpoint, chain_id) = psob_fixture(3, 2);
+        verify_psob_chain(&headers, &checkpoint, chain_id, CHAIN_POW_LIMIT_BITS)
+            .expect("valid PSob chain passes");
     }
 
     #[test]
-    fn psob_chain_rejects_broken_jkc_link() {
-        let (mut headers, parents, checkpoint, ltc_checkpoint) = psob_fixture(2);
+    fn psob_chain_rejects_broken_link() {
+        let (mut headers, checkpoint, chain_id) = psob_fixture(2, 2);
         headers[1].raw[4..36].copy_from_slice(&[0x99; 32]); // break prev-hash link
-        assert!(verify_psob_chain(&headers, &checkpoint, &parents, &ltc_checkpoint, 0x2020, CHAIN_POW_LIMIT_BITS).is_err());
+        assert!(verify_psob_chain(&headers, &checkpoint, chain_id, CHAIN_POW_LIMIT_BITS).is_err());
     }
 
     #[test]
     fn psob_chain_rejects_missing_aux_or_wrong_chain_id() {
-        let (mut headers, parents, checkpoint, ltc_checkpoint) = psob_fixture(2);
-        // missing aux witness
-        headers[0].aux = None;
-        assert!(verify_psob_chain(&headers, &checkpoint, &parents, &ltc_checkpoint, 0x2020, CHAIN_POW_LIMIT_BITS).is_err());
-        // wrong chain id (fixture says 0x2020)
-        let (headers, parents, checkpoint, ltc_checkpoint) = psob_fixture(2);
-        assert!(verify_psob_chain(&headers, &checkpoint, &parents, &ltc_checkpoint, 0x2021, CHAIN_POW_LIMIT_BITS).is_err());
+        let (mut headers, checkpoint, chain_id) = psob_fixture(2, 2);
+        headers[0].aux = None; // missing aux witness
+        assert!(verify_psob_chain(&headers, &checkpoint, chain_id, CHAIN_POW_LIMIT_BITS).is_err());
+
+        let (headers, checkpoint, chain_id) = psob_fixture(2, 2);
+        assert!(
+            verify_psob_chain(&headers, &checkpoint, chain_id ^ 1, CHAIN_POW_LIMIT_BITS).is_err()
+        );
+
+        // A tighter powLimit (harder difficulty floor) rejects headers that are
+        // easier than the floor — the difficulty bypass the check exists to stop.
+        let (headers, checkpoint, chain_id) = psob_fixture(2, 2);
+        assert!(verify_psob_chain(&headers, &checkpoint, chain_id, 0x1d00_ffff).is_err());
     }
 
     #[test]
-    fn psob_chain_rejects_ltc_anchor_and_parent_linkage() {
-        // wrong LTC checkpoint
-        let (headers, parents, checkpoint, _) = psob_fixture(2);
-        assert!(verify_psob_chain(&headers, &checkpoint, &parents, &[0x55; 32], 0x2020, CHAIN_POW_LIMIT_BITS).is_err());
-        // parent chain must end at the last JKC block's parent
-        let (headers, mut parents, checkpoint, ltc_checkpoint) = psob_fixture(2);
-        parents.truncate(1);
-        assert!(verify_psob_chain(&headers, &checkpoint, &parents, &ltc_checkpoint, 0x2020, CHAIN_POW_LIMIT_BITS).is_err());
-        // a parent absent from the LTC chain: replace the first entry with a
-        // bogus header that still chains from the anchor, so only the missing
-        // parent inclusion check can fail.
-        let (headers, parents, checkpoint, ltc_checkpoint) = psob_fixture(2);
-        let mut wrong = alloc::vec![BlockHeader { raw: alloc::vec![0xde; 80], aux: None }];
-        wrong.extend_from_slice(&parents[1..]);
-        assert!(verify_psob_chain(&headers, &checkpoint, &wrong, &ltc_checkpoint, 0x2020, CHAIN_POW_LIMIT_BITS).is_err());
+    fn psob_chain_rejects_tampered_commitment() {
+        let (mut headers, checkpoint, chain_id) = psob_fixture(2, 2);
+        // Flip a chain-branch sibling: the fold no longer reaches the committed root.
+        let aux = headers[0].aux.as_mut().unwrap();
+        if let Some(last) = aux.chain_merkle_branch.last_mut() {
+            last[0] ^= 0x01;
+        } else {
+            panic!("fixture depth must be > 0");
+        }
+        assert!(verify_psob_chain(&headers, &checkpoint, chain_id, CHAIN_POW_LIMIT_BITS).is_err());
     }
 
     #[test]
-    fn psob_chain_rejects_easy_tip_target() {
-        // The tip's nBits at the LTC powLimit is the FLOOR; an easier target is
-        // rejected (difficulty-bypass gate). Flip the tip to a relaxed target.
-        let (headers, mut parents, checkpoint, ltc_checkpoint) = psob_fixture(2);
-        parents.last_mut().unwrap().raw[72..76].copy_from_slice(&0x2000_ffffu32.to_le_bytes());
-        assert!(verify_psob_chain(&headers, &checkpoint, &parents, &ltc_checkpoint, 0x2020, CHAIN_POW_LIMIT_BITS).is_err());
+    fn psob_chain_rejects_wrong_slot_for_nonce() {
+        // The anti-grind check pins chain_index from (nonce, chain_id, height);
+        // hand the witness a mismatching index.
+        let (mut headers, checkpoint, chain_id) = psob_fixture(1, 2);
+        {
+            let aux = headers[0].aux.as_mut().unwrap();
+            let expected = get_expected_index(
+                u32::from_le_bytes(
+                    aux.coinbase_tx[aux.coinbase_tx.len() - 5..aux.coinbase_tx.len() - 1]
+                        .try_into()
+                        .unwrap(),
+                ),
+                chain_id,
+                aux.chain_merkle_branch.len() as u32,
+            );
+            aux.chain_index = (expected + 1) % (1 << aux.chain_merkle_branch.len());
+        }
+        assert!(verify_psob_chain(&headers, &checkpoint, chain_id, CHAIN_POW_LIMIT_BITS).is_err());
     }
 }

@@ -1,0 +1,54 @@
+# psob-indexer — optional TOML configuration.
+#
+# This file is ONLY used when it exists at ./psob-indexer.toml (or when
+# PSOB_CONFIG points at it). Environment variables override every value here —
+# e.g. PSOB_CHAINS beats [[chains]].
+
+# ─── Aux chains to ingest ──────────────────────────────────────────────────────
+[[chains]]
+name = "JKC"
+chain_id = 8224
+electrs_url = "https://junk-api.s3na.xyz"
+pow_limit_bits = "0x1e0fffff"   # hex, 0x prefix optional
+start_height = 1095300           # optional: cursor seed for fresh DBs
+
+[[chains]]
+name = "DINGO"
+chain_id = 50
+electrs_url = "https://dingo-api.s3na.xyz"
+pow_limit_bits = "0x1e0fffff"
+
+# ─── Storage ───────────────────────────────────────────────────────────────────
+db_path = "psob-indexer.redb"
+
+# ─── Parent-chain resolver ─────────────────────────────────────────────────────
+[resolver]
+base = "https://litecoinspace.org/api"
+api_key = ""
+parent_chain = "litecoin"
+
+# ─── Tuning ────────────────────────────────────────────────────────────────────
+max_batch = 64
+poll_interval_secs = 15
+# start_height = 1000000
+
+[retry]
+max_retries = 5
+base_backoff_ms = 500
+max_backoff_ms = 30000
+min_request_interval_ms = 0
+
+[http]
+timeout_secs = 30
+concurrency = 8
+
+# ─── REST API ──────────────────────────────────────────────────────────────────
+# bind_addr = "0.0.0.0:8080"
+# cors_origins = "*"
+
+# ─── P2P ───────────────────────────────────────────────────────────────────────
+# [p2p]
+# port = 9000
+# bind = "0.0.0.0"
+# bootstrap_nodes = ""
+# disable_mdns = false

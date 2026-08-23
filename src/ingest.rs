@@ -1,70 +1,140 @@
-//! Aux chain ingestion into the light-client store.
+//! Aux-chain ingestion into the light-client store.
 //!
-//! The ingestor walks the aux chain tip down to its stored cursor, fetching
-//! each raw `/block/:hash/header` (80 bytes + CAuxPow) and running the cheap
-//! consensus checks the ZK guest will re-run *in-circuit*:
+//! Each configured chain runs its OWN infinite task with exponential backoff
+//! and error isolation, so one flaky Electrs endpoint can never take the
+//! process down — the previous implementation polled chains sequentially and a
+//! single `?` in the loop killed the whole indexer.
+//!
+//! Per tick the ingestor walks the aux chain's stored cursor toward the live
+//! tip (bounded by `max_batch`), fetching hashes and raw header wire payloads
+//! concurrently with a bounded limit, then runs the cheap consensus checks the
+//! ZK guest re-runs *in-circuit*:
 //!
 //!   1. header is exactly 80 bytes;
 //!   2. `nVersion >> 16 == chain_id`;
-//!   3. `expand_target(nBits)` is valid (consensus range) and `≤ powLimit`;
-//!   4. `verify_auxpow_commitment` (sibling-TX + sibling-block + anti-grind);
-//!   5. header `prev_hash` links to the hash of the block one above (prev by
-//!      linkage, never by a trust-in-the-indexer height claim).
+//!   3. `expand_target(nBits)` is valid (consensus range) and `<= powLimit`;
+//!   4. `verify_auxpow_commitment` (Proof 1 + Proof 2 + anti-grind; no scrypt);
+//!   5. header `prev_hash` links to the hash of the block one below (linkage by
+//!      hash, never by a trust-in-the-indexer height claim).
 //!
 //! **No scrypt is run here** — that is the guest's expensive job and must not
 //! move off-circuit. A header failing a cheap check is logged and the chain
-//! scan stops at that height (a reorg or a malformed block should halt the
-//! walk rather than poison the store).
+//! scan stops at that height (a reorg or a malformed block should halt the walk
+//! rather than poison the store).
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-
 use chain_rpc::ElectrsClient;
-use common::{target_leq, AuxPow, BlockHeader};
-use tokio::time::sleep;
+use futures::future::join_all;
+use tokio::task::JoinHandle;
 
-use crate::config::AuxChain;
+use crate::config::{AuxChain, Config};
 use crate::db::{Database, StoredBlock};
 use crate::resolve::ParentResolver;
+use crate::verify::{light_verify, AuxBlock};
 
-fn sha256d(data: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(Sha256::digest(data)));
-    out
+/// Runs the ingest loops for every configured chain. Long-lived; spawned per
+/// chain so failures stay chain-scoped.
+pub struct Ingestor {
+    config: Config,
+    db: Arc<Database>,
+    resolver: ParentResolver,
 }
 
-/// Validate the parts of a header the light client can check without scrypt.
-/// Returns the aux-block hash (sha256d of the 80-byte header).
-fn light_verify(base: &[u8], aux: &AuxPow, chain_id: u32, pow_limit_bits: u32) -> anyhow::Result<[u8; 32]> {
-    if base.len() != 80 {
-        anyhow::bail!("light_verify: header not 80 bytes");
+impl Ingestor {
+    pub fn new(config: Config, db: Arc<Database>) -> anyhow::Result<Self> {
+        let resolver = ParentResolver::new(
+            &config.resolver.base,
+            &config.resolver.api_key,
+            &config.resolver.chain_slug,
+        )?;
+        Ok(Self {
+            config,
+            db,
+            resolver,
+        })
     }
-    let version = u32::from_le_bytes([base[0], base[1], base[2], base[3]]);
-    if version >> 16 != chain_id {
-        anyhow::bail!("chain id {} != expected {}", version >> 16, chain_id);
+
+    /// Spawn one long-running task per chain. Returns handles so the caller can
+    /// abort them all on shutdown.
+    pub fn spawn_all(&self) -> Vec<JoinHandle<()>> {
+        self.config
+            .chains
+            .iter()
+            .cloned()
+            .map(|chain| {
+                let db = Arc::clone(&self.db);
+                let resolver = self.resolver.clone();
+                let config = self.config.clone();
+                tokio::spawn(async move {
+                    chain_loop(config, db, resolver, chain).await;
+                })
+            })
+            .collect()
     }
-    let bits = u32::from_le_bytes([base[72], base[73], base[74], base[75]]);
-    let target = common::expand_target(bits)
-        .ok_or_else(|| anyhow::anyhow!("invalid nBits {bits:#010x}"))?;
-    let pow_limit = common::expand_target(pow_limit_bits)
-        .ok_or_else(|| anyhow::anyhow!("invalid powLimitBits"))?;
-    if !target_leq(&target, &pow_limit) {
-        anyhow::bail!("target easier than powLimit");
-    }
-    if aux.parent_header.len() != 80 {
-        anyhow::bail!("auxpow parent header not 80 bytes");
-    }
-    let id = sha256d(base);
-    if !common::verify_auxpow_commitment(&id, aux, chain_id) {
-        anyhow::bail!("auxpow commitment invalid");
-    }
-    Ok(id)
 }
 
-/// Ingest one aux chain from its Electrs endpoint, walking from the live tip
-/// down (reorg-safe: only back-fill a contiguous window whose linkage checks).
-pub async fn ingest_chain(
-    config: &crate::Config,
+/// One chain's infinite loop: tick → poll → backoff on error → retry.
+async fn chain_loop(config: Config, db: Arc<Database>, resolver: ParentResolver, chain: AuxChain) {
+    tracing::info!(chain = %chain.name, chain_id = chain.chain_id, url = %chain.electrs, "ingest loop started");
+    let client = ElectrsClient::with_policy(
+        &chain.electrs,
+        chain_rpc::HttpPolicy {
+            timeout: config.http.timeout,
+            max_retries: config.retry.max_retries,
+            base_backoff: config.retry.base_backoff,
+            max_backoff: config.retry.max_backoff,
+            min_request_interval: config.retry.min_request_interval,
+        },
+    );
+
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        match ingest_chain(&config, &chain, &client, &db, &resolver, config.max_batch).await {
+            Ok(ingested) => {
+                consecutive_failures = 0;
+                if ingested > 0 {
+                    tracing::info!(chain = %chain.name, ingested, "ingest batch");
+                }
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                let delay = backoff_delay(&config, consecutive_failures);
+                tracing::warn!(
+                    chain = %chain.name,
+                    failures = consecutive_failures,
+                    retry_in_ms = delay.as_millis(),
+                    err = %e,
+                    "ingest tick failed; backing off",
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        }
+        tokio::time::sleep(config.poll_interval).await;
+    }
+}
+
+/// Exponential backoff with full jitter, capped (shared shape with the RPC client).
+fn backoff_delay(config: &Config, failures: u32) -> Duration {
+    let exp = config
+        .retry
+        .base_backoff
+        .saturating_mul(2u32.saturating_pow(failures.min(12)));
+    let capped = exp.min(config.retry.max_backoff);
+    if capped.is_zero() {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_millis(fastrand::u64(0..capped.as_millis() as u64 + 1))
+    }
+}
+
+/// Ingest one batch for one chain: `[cursor+1, min(tip, cursor+max_batch)]`.
+async fn ingest_chain(
+    config: &Config,
     chain: &AuxChain,
     electrs: &ElectrsClient,
     db: &Database,
@@ -86,123 +156,195 @@ pub async fn ingest_chain(
             None => anyhow::bail!(
                 "fresh DB: PSOB_START_HEIGHT must be set (or per-chain in PSOB_CHAINS) for chain {} ({})",
                 chain.name,
-                chain.chain_id,
+                chain.chain_id
             ),
         },
     };
 
-    // Validate the configured start is behind the tip before walking.
     if cursor > tip_height {
-        anyhow::bail!(
-            "PSOB cursor height {} for {} is above tip {}",
+        tracing::warn!(
+            chain = %chain.name,
             cursor,
-            chain.name,
-            tip_height
+            tip_height,
+            "DB cursor is above the node tip (node pruned or reorged?)"
         );
+        return Ok(0);
     }
 
-    // Advance cursor to tip (ingest blocks above it). Never re-verify history
-    // that is already stored unless the next block's prev-hash disagrees.
-    let mut ingested = 0u64;
     let start = cursor.saturating_add(1);
-    let mut height = start;
+    let end = (cursor + max_batch).min(tip_height);
+    if start > end {
+        return Ok(0); // up to date
+    }
+    let window: Vec<u64> = (start..=end).collect();
 
-    // The block hash AT height — from Electrs, by height — must equal the hash
-    // of the stored block at height-1's next-in-line. We instead trust the
-    // linkage check below: stored height-1's hash must equal this header's
-    // prev_hash. Electrs by-height is just the fetch locator.
-    let mut prev_hash: Option<[u8; 32]> = if cursor > 0 {
-        db.block_at(chain.chain_id, cursor)?.map(|b| b.hash_le)
-    } else {
-        None
+    // Fetch locator hashes concurrently (bounded). By-height is ONLY a fetch
+    // locator; linkage is verified against the stored previous block hash.
+    let hashes: Vec<String> = {
+        let list = join_all(window.iter().map(|h| {
+            let c = electrs.clone();
+            async move { (*h, c.block_hash_at(*h).await) }
+        }))
+        .await;
+        let mut by_h = std::collections::HashMap::new();
+        for (h, res) in list {
+            by_h.insert(h, res.with_context(|| format!("block_hash_at #{h}"))?);
+        }
+        window
+            .iter()
+            .map(|h| by_h.remove(h).expect("every height fetched"))
+            .collect()
     };
 
-    let mut pending: Vec<(u64, [u8; 32], BlockHeader)> = Vec::new();
+    // Fetch wire payloads concurrently, collecting by height so verification can
+    // run STRICTLY in height order (the linkage check depends on it).
+    let wires: std::collections::HashMap<u64, Vec<u8>> = {
+        let list = join_all(window.iter().zip(hashes.iter()).map(|(h, hx)| {
+            let c = electrs.clone();
+            let hx = hx.clone();
+            let h = *h;
+            async move { (h, c.header_wire(&hx).await) }
+        }))
+        .await;
+        let mut by_h = std::collections::HashMap::new();
+        for (h, res) in list {
+            let wire = res.with_context(|| format!("header fetch #{h}"))?;
+            by_h.insert(h, wire);
+        }
+        by_h
+    };
 
-    while height <= tip_height && ingested < max_batch {
-        let display_hash = electrs.block_hash_at(height).await?;
-        let (base, aux) = electrs.header_with_auxpow(&display_hash).await?;
+    // Sequential, height-ordered verification + linkage gate.
+    let mut prev_hash: Option<[u8; 32]> = match cursor {
+        0 => None,
+        c => db.block_at(chain.chain_id, c)?.map(|b| b.hash_le),
+    };
 
-        let first_pass = light_verify(
-            &base,
-            &aux,
-            chain.chain_id,
-            // The indexer's own sanity floor, configured per-chain from env;
-            // the ZK guest + contract pin the authoritative one in the journal.
-            chain.pow_limit_bits,
-        );
-        let id = match first_pass {
-            Ok(id) => id,
+    let mut pending: Vec<StoredBlock> = Vec::new();
+    let mut stop_after: Option<u64> = None;
+
+    for height in window {
+        let Some(wire) = wires.get(&height) else {
+            continue;
+        };
+        let aux_block = match AuxBlock::from_wire(wire.clone()) {
+            Ok(b) => b,
             Err(e) => {
-                tracing::warn!(chain = %chain.name, height, err = %e, "light verify failed at height; halting walk");
+                tracing::warn!(chain = %chain.name, height, err = %e, "auxpow parse failed at height; halting walk");
+                stop_after = Some(height);
                 break;
             }
         };
 
-        // Linkage gate: this header's prev_hash must equal the previous (higher)
-        // block we stored. Guards against reorgs mid-walk and against a
-        // fork-hopping indexer silently merging two chains.
+        // Cheap consensus checks (no scrypt) — full PSob gate.
+        let id = match light_verify(
+            &aux_block.base,
+            &aux_block.aux,
+            chain.chain_id,
+            chain.pow_limit_bits,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    chain = %chain.name,
+                    height,
+                    err = %e,
+                    "light verify failed at height; halting walk"
+                );
+                stop_after = Some(height);
+                break;
+            }
+        };
+
+        // Linkage gate: this header's prev_hash must equal the previous (lower)
+        // block. Guards against reorgs mid-walk and against a fork-hopping
+        // indexer silently merging two chains.
         if let Some(p) = prev_hash {
-            let prev_field: [u8; 32] = base[4..36].try_into().unwrap();
-            if prev_field != p {
-                tracing::warn!(chain = %chain.name, height, "prev_hash linkage broken at {height} (reorg?)");
+            if aux_block.base[4..36] != p {
+                tracing::warn!(
+                    chain = %chain.name,
+                    height,
+                    "prev_hash linkage broken at {height} (reorg?) — rolling back and halting"
+                );
                 db.rollback_from(chain.chain_id, height)?;
+                stop_after = Some(height);
                 break;
             }
         }
 
-        pending.push((height, id, BlockHeader { raw: base.to_vec(), aux: Some(aux) }));
         prev_hash = Some(id);
-        height += 1;
-        ingested += 1;
+        pending.push(StoredBlock {
+            hash_le: id,
+            chain_id: chain.chain_id,
+            height,
+            header: aux_block.header(),
+            wire_hex: hex::encode(&aux_block.wire),
+        });
     }
 
-    // Persist in height order, then advance cursor to the tallest stored height
-    // so the next tick only walks the fresh frontier (not the re-ingest window).
-    let last = pending.last().map(|(h, _, _)| *h);
-    for (h, id, header) in pending.into_iter() {
-        let block = StoredBlock { hash_le: id, chain_id: chain.chain_id, height: h, header };
-        db.insert_block(chain.chain_id, h, &block)?;
-    }
-    if let Some(h) = last {
-        db.set_cursor_height(chain.chain_id, h)?;
-    }
-
-    // Classify any previously unseen parents against Litecoin mainnet.
-    for p in db.unclassified_parents()? {
-        let ltc_height = resolver.resolve(&p).await?;
-        db.classify_parent(&p, ltc_height)?;
-        if let Some(h) = ltc_height {
-            tracing::info!(parent = hex::encode(p), ltc_height = h, "parent is Litecoin mainnet block");
-        } else {
-            tracing::debug!(parent = hex::encode(p), "parent not on Litecoin mainnet (trial)");
-        }
+    if !pending.is_empty() {
+        let rows: Vec<(u32, u64, StoredBlock)> = pending
+            .iter()
+            .map(|b| (b.chain_id, b.height, b.clone()))
+            .collect();
+        db.insert_blocks(&rows)?;
+        let last = pending
+            .last()
+            .map(|b| b.height)
+            .unwrap_or(start.saturating_sub(1));
+        db.set_cursor_height(chain.chain_id, last)?;
+    } else if let Some(h) = stop_after {
+        // Nothing new stored; no cursor advance (the bad/rolled-back zone stays
+        // re-scannable next tick).
+        let _ = h;
     }
 
-    Ok(ingested)
+    // Classify any previously unseen parents against the parent chain (mainnet).
+    classify_pending_parents(db, resolver, config).await?;
+
+    Ok(pending.len() as u64)
 }
 
-/// Continuous ingest loop for all configured chains using a shared Database instance.
-pub async fn run_with_db(config: crate::Config, db: std::sync::Arc<Database>) -> anyhow::Result<()> {
-    let resolver =
-        ParentResolver::new(&config.ccnodes_base, &config.ccnodes_api_key, &config.parent_chain)?;
-
-    loop {
-        for chain in &config.chains {
-            let electrs = ElectrsClient::new(&chain.electrs);
-            // A batch per tick is bounded so a huge tip-diff doesn't snapshot the
-            // whole window at once (bounded by config.max_batch from env).
-            let batch = ingest_chain(&config, chain, &electrs, &db, &resolver, config.max_batch).await?;
-            if batch > 0 {
-                tracing::info!(chain = %chain.name, ingested = batch, "ingest batch");
+/// Resolve unclassified parents concurrently (bounded). Classifications are
+/// best-effort — a resolver that is down is retried next tick, never fatal.
+async fn classify_pending_parents(
+    db: &Database,
+    resolver: &ParentResolver,
+    _config: &Config,
+) -> anyhow::Result<()> {
+    let unclassified = db.unclassified_parents();
+    if unclassified.is_empty() {
+        return Ok(());
+    }
+    let results = join_all(unclassified.into_iter().map(|parent| {
+        let resolver = resolver.clone();
+        async move { (parent, resolver.resolve(&parent).await) }
+    }))
+    .await;
+    for (parent, resolved) in results {
+        let ltc_height = resolved.ok().flatten();
+        db.classify_parent(&parent, ltc_height)?;
+        let parent_display = {
+            let mut b = parent;
+            b.reverse();
+            hex::encode(b)
+        };
+        match ltc_height {
+            Some(h) => {
+                tracing::info!(parent = %parent_display, ltc_height = h, "parent is mainnet block")
             }
+            None => tracing::debug!(parent = %parent_display, "parent not on mainnet (trial)"),
         }
-        sleep(config.poll_interval).await;
     }
+    Ok(())
 }
 
-/// Continuous ingest loop for all configured chains (opens DB from path).
-pub async fn run(config: crate::Config) -> anyhow::Result<()> {
-    let db = std::sync::Arc::new(Database::open(&config.db_path)?);
-    run_with_db(config, db).await
+/// Continuous ingest for all chains from a shared DB (kept for CLI/tests).
+pub async fn run(config: Config, db: Arc<Database>) -> anyhow::Result<()> {
+    let ingestor = Ingestor::new(config, db)?;
+    let handles = ingestor.spawn_all();
+    for h in handles {
+        let _ = h.await;
+    }
+    Ok(())
 }

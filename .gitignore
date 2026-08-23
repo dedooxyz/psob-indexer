@@ -1,9 +1,5 @@
 target/
-**/*.rs.bk
-*.db
-*.db-journal
-*.sqlite
-*.sqlite3
-data/
+*.redb
+*.sqlite*
 .env
-.DS_Store
+psob-indexer.toml

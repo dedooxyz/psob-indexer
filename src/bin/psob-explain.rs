@@ -88,10 +88,17 @@ fn main() -> ExitCode {
 
     // ── 1. Shared (sibling) parents ───────────────────────────────────────────
     println!("=== 1. Cross-chain sibling parents (≥{min_legs} legs, mainnet only) ===");
-    let shared = db.shared_mainnet_parents(min_legs, 10).context("shared_mainnet_parents").unwrap_or_else(|e| {
-        eprintln!("{e:#}");
-        std::process::exit(2);
-    });
+    let shared = db
+        .shared_mainnet_parents(
+            min_legs,
+            psob_indexer::db::Page::new(Some(10), Some(0)),
+            None,
+        )
+        .context("shared_mainnet_parents")
+        .unwrap_or_else(|e| {
+            eprintln!("{e:#}");
+            std::process::exit(2);
+        });
     if shared.is_empty() {
         println!("  (none yet — ingest more blocks first)");
     }
@@ -112,7 +119,10 @@ fn main() -> ExitCode {
     // ── 2. Invariant check on the top sibling group ───────────────────────────
     if let Some(top) = shared.first() {
         println!();
-        println!("=== 2. PSob invariant check (top sibling group @ LTC #{}) ===", top.ltc_height);
+        println!(
+            "=== 2. PSob invariant check (top sibling group @ LTC #{}) ===",
+            top.ltc_height
+        );
         let siblings = db
             .siblings_for_parent(&top.parent_hash_le)
             .context("siblings_for_parent")
@@ -137,12 +147,18 @@ fn main() -> ExitCode {
         }
         let first = roots[0].2;
         let all_same = roots.iter().all(|(_, _, r)| *r == first);
-        println!("  ⇒ all {} siblings fold to the SAME chain root: {}", roots.len(), if all_same { "YES ✓" } else { "NO ✗" });
+        println!(
+            "  ⇒ all {} siblings fold to the SAME chain root: {}",
+            roots.len(),
+            if all_same { "YES ✓" } else { "NO ✗" }
+        );
         // And with the coinbase: the root must be committed after the magic.
         let aux = siblings[0].header.aux.as_ref().unwrap();
         match root_committed_in_coinbase(&aux.coinbase_tx, &first) {
             true => println!("  ⇒ root committed in LTC coinbase after fabe6d6d: YES ✓"),
-            false => println!("  ⇒ root committed in LTC coinbase: NO ✗ (indexer data inconsistent!)"),
+            false => {
+                println!("  ⇒ root committed in LTC coinbase: NO ✗ (indexer data inconsistent!)")
+            }
         }
     }
 
@@ -150,21 +166,31 @@ fn main() -> ExitCode {
     if let (Some(a), Some(b)) = (ltc_start, ltc_end) {
         println!();
         println!("=== 3. Epoch witness [LTC #{a} .. LTC #{b}] ===");
-        let rows = db.epoch_blocks(a, b).context("epoch_blocks").unwrap_or_else(|e| {
-            eprintln!("{e:#}");
-            std::process::exit(2);
-        });
+        let rows = db
+            .epoch_blocks(a, b, None, psob_indexer::db::Page::default())
+            .context("epoch_blocks")
+            .unwrap_or_else(|e| {
+                eprintln!("{e:#}");
+                std::process::exit(2);
+            });
         if rows.is_empty() {
             println!("  (no blocks anchored inside this epoch in the cache)");
         }
-        let mut by_chain: std::collections::BTreeMap<u32, Vec<(u64, u64, [u8; 32])>> = Default::default();
+        let mut by_chain: std::collections::BTreeMap<u32, Vec<(u64, u64, [u8; 32])>> =
+            Default::default();
         for (chain_id, height, ltc_h, hash_le) in rows {
-            by_chain.entry(chain_id).or_default().push((height, ltc_h, hash_le));
+            by_chain
+                .entry(chain_id)
+                .or_default()
+                .push((height, ltc_h, hash_le));
         }
         for (chain_id, vec) in by_chain {
             println!("  chain {chain_id}: {} blocks anchored in epoch", vec.len());
             for (height, ltc_h, hash_le) in vec {
-                println!("    aux #{height:<9} LTC parent #{ltc_h:<9} {}", hex_le(&hash_le));
+                println!(
+                    "    aux #{height:<9} LTC parent #{ltc_h:<9} {}",
+                    hex_le(&hash_le)
+                );
             }
         }
     }
