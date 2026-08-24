@@ -41,6 +41,8 @@ pub struct ParentResolver {
     base: String,
     api_key: String,
     chain_slug: String,
+    /// flat = esplora-style: `{base}/block/{hash}` (auto-detected).
+    flat: bool,
     policy: HttpPolicy,
     /// Optional secondary explorer used only on transport failure.
     fallback_base: Option<String>,
@@ -84,6 +86,12 @@ impl ParentResolver {
         policy: HttpPolicy,
         fallback_base: Option<String>,
     ) -> Self {
+        let base_str = base.into().trim_end_matches('/').to_string();
+        // esplora-style flat pattern if the base looks like an esplora/e-s3na
+        // endpoint; ccnodes-style `{base}/{chain}/block/{hash}` otherwise.
+        let flat = base_str.ends_with("/api")
+            || base_str.contains("litecoinspace")
+            || base_str.contains("s3na.xyz");
         Self {
             // Timeout mirrors chain-rpc's fix for junk-api's silent-TCP behavior.
             http: Arc::new(
@@ -92,9 +100,10 @@ impl ParentResolver {
                     .build()
                     .expect("reqwest client builder cannot fail with just a timeout"),
             ),
-            base: base.into().trim_end_matches('/').to_string(),
+            base: base_str,
             api_key: api_key.into(),
             chain_slug: chain_slug.into(),
+            flat,
             policy,
             fallback_base: fallback_base.map(|b| b.trim_end_matches('/').to_string()),
         }
@@ -111,7 +120,7 @@ impl ParentResolver {
 
         // Format URL: if base ends with /api (like litecoinspace.org/api), use
         // /block/{hash} directly. If CCNodes, use /{chain_slug}/block/{hash}.
-        let url = if self.base.ends_with("/api") || self.base.contains("litecoinspace") {
+        let url = if self.flat {
             format!("{}/block/{}", self.base, hash_hex)
         } else {
             format!("{}/{}/block/{}", self.base, self.chain_slug, hash_hex)

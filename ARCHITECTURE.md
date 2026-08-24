@@ -170,7 +170,7 @@ byte-exact agreement with the TS port. Build: `cargo build -p psob-wasm
 
 - **New chain**: add an entry to `PSOB_CHAINS` (or `[[chains]]` in TOML) —
   hashes, powLimit, chain-id, and start height. No code change.
-- **Different parent chain**: point `PSOB_CCNODES_BASE` / `PSOB_PARENT_CHAIN`
+- **Different parent chain**: point `PSOB_PARENT_ELECTRS` / `PSOB_PARENT_CHAIN`
   at another explorer. (PSob is *generic* across AuxPoW parents.)
 - **Gossip beyond intents**: subscribe to the two other topics and publish
   verified data from the ingest path.

@@ -43,7 +43,7 @@ pub struct ResolverConfig {
     /// Chain slug of the parent chain, e.g. "litecoin".
     pub chain_slug: String,
     /// Optional secondary explorer used ONLY on transport failure of the
-    /// primary (`PSOB_CCNODES_FALLBACK_BASE`). Never hardcoded.
+    /// primary (`PSOB_PARENT_ELECTRS_FALLBACK`). Never hardcoded.
     pub fallback_base: Option<String>,
 }
 
@@ -179,16 +179,18 @@ impl Config {
             .or_else(|| file.as_ref().and_then(|f| f.db_path.clone()))
             .unwrap_or_else(|| "psob-indexer.redb".to_string());
 
-        let resolver_base = env_var("PSOB_CCNODES_BASE")?
+        // Generic parent-explorer envs (PSOB_PARENT_ELECTRS/*). The legacy
+        // CCNODES-named aliases are kept as a deprecated fallback.
+        let resolver_base = env_first(&["PSOB_PARENT_ELECTRS", "PSOB_CCNODES_BASE"])?
             .or_else(|| file.as_ref().and_then(|f| f.resolver.base.clone()))
             .unwrap_or_else(|| "https://litecoinspace.org/api".to_string());
-        let resolver_key = env_var("CCNODES_API_KEY")?
+        let resolver_key = env_first(&["PSOB_PARENT_API_KEY", "CCNODES_API_KEY"])?
             .or_else(|| file.as_ref().and_then(|f| f.resolver.api_key.clone()))
             .unwrap_or_default();
         let parent_chain = env_var("PSOB_PARENT_CHAIN")?
             .or_else(|| file.as_ref().and_then(|f| f.resolver.parent_chain.clone()))
             .unwrap_or_else(|| "litecoin".to_string());
-        let fallback_base = env_var("PSOB_CCNODES_FALLBACK_BASE")?
+        let fallback_base = env_first(&["PSOB_PARENT_ELECTRS_FALLBACK", "PSOB_CCNODES_FALLBACK_BASE"])?
             .or_else(|| file.as_ref().and_then(|f| f.resolver.fallback_base.clone()))
             .filter(|b| !b.is_empty());
 
@@ -376,6 +378,16 @@ fn env_var(key: &str) -> anyhow::Result<Option<String>> {
         Ok(_) => Ok(None),
         Err(_) => Ok(None),
     }
+}
+
+/// First set value among the given env names (deprecated aliases allowed).
+fn env_first(names: &[&str]) -> anyhow::Result<Option<String>> {
+    for n in names {
+        if let Ok(Some(v)) = env_var(n) {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
 }
 
 /// Parse a numeric env value; malformed or empty values are treated as unset

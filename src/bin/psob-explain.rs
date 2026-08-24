@@ -56,9 +56,14 @@ fn main() -> ExitCode {
     let mut ltc_start = None;
     let mut ltc_end = None;
     let mut min_legs = 2usize;
+    let mut prune_chain: Option<u32> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
+            "--prune-chain" => {
+                i += 1;
+                prune_chain = args.get(i).and_then(|v| v.parse().ok());
+            }
             "--ltc-start" => {
                 i += 1;
                 ltc_start = args.get(i).and_then(|v| v.parse().ok());
@@ -85,6 +90,19 @@ fn main() -> ExitCode {
         eprintln!("cannot open db: {e:#}");
         std::process::exit(2);
     });
+
+    if let Some(chain_id) = prune_chain {
+        match db.prune_before(chain_id, u64::MAX) {
+            Ok(removed) => {
+                println!("pruned chain {chain_id}: {removed} blocks removed");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("prune failed: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     // ── 1. Shared (sibling) parents ───────────────────────────────────────────
     println!("=== 1. Cross-chain sibling parents (≥{min_legs} legs, mainnet only) ===");
