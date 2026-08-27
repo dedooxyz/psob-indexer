@@ -428,6 +428,25 @@ impl Database {
         Ok(None)
     }
 
+    /// Highest indexed height for one chain, or `None` if the chain has no
+    /// blocks yet. Used by the co-settlement endpoint to default to the tip.
+    pub fn latest_height(&self, chain_id: u32) -> anyhow::Result<Option<u64>> {
+        let read_txn = self.redb.begin_read()?;
+        let table = read_txn.open_table(TABLE_AUX_BLOCKS)?;
+        let last = table
+            .range((chain_id, 0u64)..=(chain_id, u64::MAX))?
+            .rev()
+            .next();
+        match last {
+            Some(item) => {
+                let item = item?;
+                let h = item.0.value().1;
+                Ok(Some(h))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Range query over one chain: `[from, to]` heights, paged.
     pub fn blocks_range(
         &self,

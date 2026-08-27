@@ -78,6 +78,7 @@ impl AppState {
         p2p_status_handler,
         p2p_peers_handler,
         p2p_broadcast_handler,
+        cosettle_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -95,7 +96,9 @@ impl AppState {
         VerifyResponse,
         StatsResponse,
         StatsChain,
-        Paged<SiblingSummary>
+        Paged<SiblingSummary>,
+        CoSettleResponse,
+        CoSettleLeg
     )),
     tags(
         (name = "health", description = "Service liveness"),
@@ -104,7 +107,8 @@ impl AppState {
         (name = "blocks", description = "Indexed aux blocks and their PSob proofs"),
         (name = "epoch", description = "Epoch witness windows"),
         (name = "verify", description = "Client-side verification helpers"),
-        (name = "p2p", description = "Libp2p gossip mesh")
+        (name = "p2p", description = "Libp2p gossip mesh"),
+        (name = "psob-swap", description = "PSOB psob-swap/1 order book + co-settlement")
     )
 )]
 pub struct ApiDoc;
@@ -282,6 +286,48 @@ pub struct ProofResponse {
 pub struct BlocksResponse {
     pub chain_id: u32,
     pub blocks: Vec<BlockResponse>,
+}
+
+/// Query for the PSOB co-settlement proof. Heights default to each chain's
+/// latest indexed block when omitted (so a client can ask "are the two chains
+/// currently co-settled at the tip?").
+#[derive(Debug, Deserialize)]
+pub struct CoSettleQuery {
+    pub a_chain: u32,
+    #[serde(default)]
+    pub a_height: Option<u64>,
+    pub b_chain: u32,
+    #[serde(default)]
+    pub b_height: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CoSettleLeg {
+    pub chain_id: u32,
+    pub height: u64,
+    /// Display (big-endian) hex of the aux block.
+    pub block_hash: String,
+    /// Display (big-endian) hex of the embedded Litecoin parent.
+    pub parent_hash: String,
+    pub ltc_height: Option<u64>,
+    pub is_auxpow: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CoSettleResponse {
+    /// True iff both legs embed the *same* Litecoin parent block — i.e. the two
+    /// on-chain settlements are provably co-temporal under one LTC anchor.
+    pub co_settled: bool,
+    /// Display (big-endian) hex of the shared Litecoin parent (None if not).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_ltc_parent: Option<String>,
+    pub ltc_height: Option<u64>,
+    /// Co-settlement receipt token: sha256 of the canonical
+    /// `(a_chain,a_height,b_chain,b_height,parent_a,parent_b)` tuple.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    pub a: CoSettleLeg,
+    pub b: CoSettleLeg,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -550,6 +596,108 @@ async fn list_swap_intents(
     Ok(Json(json!({"total": total, "intents": items})))
 }
 
+/// Build one leg of the co-settlement response from a stored block.
+fn cosettle_leg(
+    state: &AppState,
+    chain_id: u32,
+    height: u64,
+    block: &StoredBlock,
+    parent_le: Option<[u8; 32]>,
+) -> CoSettleLeg {
+    let block_hash = display_hex(&block.hash_le);
+    let (parent_hash, ltc_height, is_auxpow) = match (&block.header.aux, parent_le) {
+        (Some(_), Some(p)) => {
+            let info = state.db.get_parent(&p).ok().flatten();
+            (display_hex(&p), info.and_then(|i| i.ltc_height), true)
+        }
+        _ => (String::new(), None, false),
+    };
+    CoSettleLeg {
+        chain_id,
+        height,
+        block_hash,
+        parent_hash,
+        ltc_height,
+        is_auxpow,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/cosettle",
+    tag = "psob-swap",
+    params(
+        ("a_chain" = u32, Query, description = "Aux chain id of leg A"),
+        ("a_height" = Option<u64>, Query, description = "Block height of leg A (default: latest indexed)"),
+        ("b_chain" = u32, Query, description = "Aux chain id of leg B"),
+        ("b_height" = Option<u64>, Query, description = "Block height of leg B (default: latest indexed)")
+    ),
+    responses(
+        (status = 200, description = "Co-settlement proof for the two legs", body = CoSettleResponse),
+        (status = 404, description = "Chain/height not indexed"),
+        (status = 400, description = "Malformed query")
+    )
+)]
+async fn cosettle_handler(
+    State(state): State<AppState>,
+    Query(q): Query<CoSettleQuery>,
+) -> Result<Json<CoSettleResponse>, ApiError> {
+    let a_height = match q.a_height {
+        Some(h) => h,
+        None => state
+            .db
+            .latest_height(q.a_chain)?
+            .ok_or_else(|| ApiError::NotFound(format!("no blocks indexed for chain {}", q.a_chain)))?,
+    };
+    let b_height = match q.b_height {
+        Some(h) => h,
+        None => state
+            .db
+            .latest_height(q.b_chain)?
+            .ok_or_else(|| ApiError::NotFound(format!("no blocks indexed for chain {}", q.b_chain)))?,
+    };
+    let ba = state
+        .db
+        .block_at(q.a_chain, a_height)?
+        .ok_or_else(|| ApiError::NotFound(format!("block {}@{} is not indexed", q.a_chain, a_height)))?;
+    let bb = state
+        .db
+        .block_at(q.b_chain, b_height)?
+        .ok_or_else(|| ApiError::NotFound(format!("block {}@{} is not indexed", q.b_chain, b_height)))?;
+
+    let pa = ba.header.aux.as_ref().map(|a| crate::db::sha256d(&a.parent_header));
+    let pb = bb.header.aux.as_ref().map(|a| crate::db::sha256d(&a.parent_header));
+    let co_settled = matches!((&pa, &pb), (Some(x), Some(y)) if x == y);
+
+    let (shared_ltc_parent, ltc_height, epoch) = if co_settled {
+        let p = pa.unwrap();
+        let info = state.db.get_parent(&p)?;
+        let ltc_h = info.and_then(|i| i.ltc_height);
+        let token = crate::db::sha256d(
+            format!(
+                "{}/{}/{}/{}/{}/{}",
+                q.a_chain, a_height, q.b_chain, b_height, display_hex(&p), display_hex(&p)
+            )
+            .as_bytes(),
+        );
+        (Some(display_hex(&p)), ltc_h, Some(display_hex(&token)))
+    } else {
+        (None, None, None)
+    };
+
+    let a_leg = cosettle_leg(&state, q.a_chain, a_height, &ba, pa);
+    let b_leg = cosettle_leg(&state, q.b_chain, b_height, &bb, pb);
+
+    Ok(Json(CoSettleResponse {
+        co_settled,
+        shared_ltc_parent,
+        ltc_height,
+        epoch,
+        a: a_leg,
+        b: b_leg,
+    }))
+}
+
 pub fn create_router(state: AppState) -> Router {
     let cors = if state.config.cors_origins.iter().any(|o| o == "*") {
         CorsLayer::permissive()
@@ -620,6 +768,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/p2p/broadcast", post(p2p_broadcast_handler))
         .route("/api/v1/swap/intents", get(list_swap_intents))
         .route("/api/v1/swap/intents", post(create_swap_intent))
+        .route("/api/v1/cosettle", get(cosettle_handler))
         .with_state(state);
     let docs: Router<()> = utoipa_swagger_ui::SwaggerUi::new("/docs")
         .url("/api/v1/openapi.json", openapi_doc())
