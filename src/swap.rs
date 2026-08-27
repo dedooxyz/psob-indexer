@@ -70,29 +70,87 @@ pub fn validate_swap_intent(
     verify_intent_signature(intent)
 }
 
+/// Canonical, deterministic JSON serialization of a swap intent used as the
+/// signed message. Keys are in a FIXED order with NO whitespace, and the
+/// `signature` field is deliberately EXCLUDED (you cannot sign what you are
+/// about to produce). This exact byte layout MUST be reproduced by every
+/// signing client (the Android wallet mirrors `PsobSwapSigning.canonicalJson`).
+fn canonical_intent_json(intent: &SwapIntentMessage) -> String {
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+    format!(
+        "{{\"protocol\":\"{}\",\"version\":{},\"intent_id\":\"{}\",\"maker_pubkey\":\"{}\",\"from_chain\":{},\"to_chain\":{},\"from_amount\":{},\"to_amount\":{},\"maker_receive_address\":\"{}\",\"timestamp\":{},\"expiry\":{},\"settlement\":\"{}\"}}",
+        esc(&intent.protocol),
+        intent.version,
+        esc(&intent.intent_id),
+        esc(&intent.maker_pubkey),
+        intent.from_chain,
+        intent.to_chain,
+        intent.from_amount,
+        intent.to_amount,
+        esc(&intent.maker_receive_address),
+        intent.timestamp,
+        intent.expiry,
+        esc(&intent.settlement),
+    )
+}
+
 /// Verify the maker's signature over the intent.
 ///
-/// **Currently stubbed**: no ECDSA backend is available in the workspace and
-/// offline builds cannot pull one in. Verification is gated behind
-/// `PSOB_REQUIRE_SIGNATURES=1`; until a `k256`/`secp256k1` dependency is added
-/// and the check implemented, the default is to accept structurally-valid
-/// intents WITHOUT cryptographic authentication (logged as a warning).
-fn verify_intent_signature(intent: &SwapIntentMessage) -> anyhow::Result<()> {
+/// Gated behind `PSOB_REQUIRE_SIGNATURES=1` (default off, so the order book
+/// still accepts unsigned intents from clients that don't yet sign). When on,
+/// the maker's compact ECDSA signature over `SHA256(canonical JSON without
+/// signature)` must verify against `maker_pubkey`.
+pub fn verify_intent_signature(intent: &SwapIntentMessage) -> anyhow::Result<()> {
     let enforce = std::env::var("PSOB_REQUIRE_SIGNATURES")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if !enforce {
         tracing::warn!(
             intent_id = %intent.intent_id,
-            "swap intent signature NOT verified (set PSOB_REQUIRE_SIGNATURES=1 to enforce; \
-             ECDSA backend not yet wired)"
+            "swap intent signature NOT verified (set PSOB_REQUIRE_SIGNATURES=1 to enforce)"
         );
         return Ok(());
     }
-    // TODO: compute intent_hash = SHA256(canonical sorted JSON without `signature`)
-    // and verify compact ECDSA over it with `maker_pubkey`. Requires a secp256k1
-    // crate (add `k256` or `secp256k1` to Cargo.toml).
-    anyhow::bail!("signature verification not yet implemented (add a secp256k1 ECDSA backend)")
+    verify_intent_signature_inner(intent)
+}
+
+/// The actual cryptographic check (no gating) — also exercised directly by
+/// tests. Signature is compact 64-byte ECDSA over the SHA256 of the canonical
+/// intent JSON (see `canonical_intent_json`).
+fn verify_intent_signature_inner(intent: &SwapIntentMessage) -> anyhow::Result<()> {
+    use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
+    use sha2::{Digest, Sha256};
+
+    let canonical = canonical_intent_json(intent);
+    let digest = Sha256::digest(canonical.as_bytes());
+    let msg = Message::from_digest_slice(&digest)
+        .map_err(|e| anyhow::anyhow!("invalid message digest: {e}"))?;
+
+    let pk_bytes = hex::decode(&intent.maker_pubkey)
+        .map_err(|e| anyhow::anyhow!("maker_pubkey not hex: {e}"))?;
+    let pk = PublicKey::from_slice(&pk_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid maker_pubkey ({} bytes): {e}", pk_bytes.len()))?;
+
+    let sig_bytes = hex::decode(&intent.signature)
+        .map_err(|e| anyhow::anyhow!("signature not hex: {e}"))?;
+    let sig = Signature::from_compact(&sig_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid compact signature: {e}"))?;
+
+    Secp256k1::verification_only()
+        .verify_ecdsa(&msg, &sig, &pk)
+        .map_err(|e| anyhow::anyhow!("swap intent signature verification failed: {e}"))?;
+    tracing::info!(intent_id = %intent.intent_id, "swap intent signature verified");
+    Ok(())
 }
 
 fn now_unix() -> u64 {
@@ -101,4 +159,94 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secp256k1::{Secp256k1, SecretKey, ecdsa::Signature};
+    use sha2::{Digest, Sha256};
+
+    fn signed_intent(mut intent: SwapIntentMessage, sk: &SecretKey) -> SwapIntentMessage {
+        // maker_pubkey is part of the signed payload; fill it first.
+        let pk = secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), sk);
+        intent.maker_pubkey = hex::encode(pk.serialize());
+        let canonical = canonical_intent_json(&intent);
+        let digest = Sha256::digest(canonical.as_bytes());
+        let msg = secp256k1::Message::from_digest_slice(&digest).unwrap();
+        let sig: Signature = Secp256k1::signing_only().sign_ecdsa(&msg, sk);
+        intent.signature = hex::encode(sig.serialize_compact());
+        intent
+    }
+
+    fn base_intent() -> SwapIntentMessage {
+        SwapIntentMessage {
+            protocol: "psob-swap".into(),
+            version: 1,
+            intent_id: "test-intent-1".into(),
+            maker_pubkey: String::new(),
+            from_chain: 8211,
+            to_chain: 63,
+            from_amount: 1_000_000,
+            to_amount: 2_000_000,
+            maker_receive_address: "LUCKYRECEIVEADDRESS".into(),
+            timestamp: 1_700_000_000,
+            expiry: 1_700_000_000 + 86_400,
+            settlement: "adaptor-v1".into(),
+            signature: String::new(),
+        }
+    }
+
+    #[test]
+    fn valid_signature_verifies() {
+        let sk = SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let intent = signed_intent(base_intent(), &sk);
+        assert!(verify_intent_signature_inner(&intent).is_ok());
+    }
+
+    #[test]
+    fn canonical_json_contract() {
+        // This literal MUST match the Android `PsobSwapSigning.canonicalJson`
+        // output byte-for-byte — it is the cross-implementation contract.
+        let intent = SwapIntentMessage {
+            maker_pubkey: "02abcdef".into(),
+            ..base_intent()
+        };
+        let got = canonical_intent_json(&intent);
+        let expected = "{\"protocol\":\"psob-swap\",\"version\":1,\"intent_id\":\"test-intent-1\",\"maker_pubkey\":\"02abcdef\",\"from_chain\":8211,\"to_chain\":63,\"from_amount\":1000000,\"to_amount\":2000000,\"maker_receive_address\":\"LUCKYRECEIVEADDRESS\",\"timestamp\":1700000000,\"expiry\":1700086400,\"settlement\":\"adaptor-v1\"}";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn tampered_signature_fails() {
+        let sk = SecretKey::from_slice(&[0x22; 32]).unwrap();
+        let mut intent = signed_intent(base_intent(), &sk);
+        // Flip a byte in the signature.
+        intent.signature = intent.signature.chars().take(2).collect::<String>()
+            + &intent.signature.chars().skip(2).collect::<String>().replace("0", "f");
+        assert!(verify_intent_signature_inner(&intent).is_err());
+    }
+
+    #[test]
+    fn tampered_payload_fails() {
+        let sk = SecretKey::from_slice(&[0x33; 32]).unwrap();
+        let mut intent = signed_intent(base_intent(), &sk);
+        intent.to_amount = 9_999_999; // changes the signed message
+        assert!(verify_intent_signature_inner(&intent).is_err());
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let sk = SecretKey::from_slice(&[0x44; 32]).unwrap();
+        let other = SecretKey::from_slice(&[0x55; 32]).unwrap();
+        let mut intent = signed_intent(base_intent(), &other);
+        // Re-sign the canonical payload with the WRONG key but keep maker_pubkey
+        // from `other`; verification must fail because sig != key.
+        let canonical = canonical_intent_json(&intent);
+        let digest = Sha256::digest(canonical.as_bytes());
+        let msg = secp256k1::Message::from_digest_slice(&digest).unwrap();
+        let sig: Signature = Secp256k1::signing_only().sign_ecdsa(&msg, &sk);
+        intent.signature = hex::encode(sig.serialize_compact());
+        assert!(verify_intent_signature_inner(&intent).is_err());
+    }
 }
