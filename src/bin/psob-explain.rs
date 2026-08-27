@@ -106,7 +106,7 @@ fn main() -> ExitCode {
 
     // ── 1. Shared (sibling) parents ───────────────────────────────────────────
     println!("=== 1. Cross-chain sibling parents (≥{min_legs} legs, mainnet only) ===");
-    let shared = db
+    let (shared, _) = db
         .shared_mainnet_parents(
             min_legs,
             psob_indexer::db::Page::new(Some(10), Some(0)),
@@ -184,7 +184,7 @@ fn main() -> ExitCode {
     if let (Some(a), Some(b)) = (ltc_start, ltc_end) {
         println!();
         println!("=== 3. Epoch witness [LTC #{a} .. LTC #{b}] ===");
-        let rows = db
+        let (rows, _) = db
             .epoch_blocks(a, b, None, psob_indexer::db::Page::default())
             .context("epoch_blocks")
             .unwrap_or_else(|e| {

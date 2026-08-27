@@ -13,6 +13,7 @@ use libp2p::{
 use tokio::sync::{mpsc, RwLock};
 
 use super::{GossipMessage, P2pConfig, P2pHandle, P2pStatus};
+use crate::db::Database;
 
 pub const TOPIC_HEADERS: &str = "/psob/headers/v1";
 pub const TOPIC_SIBLINGS: &str = "/psob/siblings/v1";
@@ -28,6 +29,7 @@ pub struct AppBehaviour {
 
 pub async fn start_p2p_swarm(
     config: P2pConfig,
+    db: std::sync::Arc<Database>,
 ) -> anyhow::Result<(P2pHandle, impl std::future::Future<Output = ()>)> {
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -126,7 +128,7 @@ pub async fn start_p2p_swarm(
     };
 
     let swarm_task = async move {
-        run_swarm_loop(swarm, status, rx_gossip).await;
+        run_swarm_loop(swarm, status, rx_gossip, db).await;
     };
 
     Ok((handle, swarm_task))
@@ -136,6 +138,7 @@ async fn run_swarm_loop(
     mut swarm: Swarm<AppBehaviour>,
     status: Arc<RwLock<P2pStatus>>,
     mut rx_gossip: mpsc::Receiver<GossipMessage>,
+    db: Arc<Database>,
 ) {
     loop {
         tokio::select! {
@@ -175,6 +178,34 @@ async fn run_swarm_loop(
                     })) => {
                         let topic = message.topic.as_str();
                         tracing::info!(peer = %peer_id, topic = %topic, msg_id = %id, "received gossipsub message");
+                        if topic == TOPIC_INTENTS {
+                            match serde_json::from_slice::<crate::p2p::SwapIntentMessage>(&message.data) {
+                                Ok(intent) => {
+                                    let known: std::collections::HashSet<u32> = db
+                                        .chain_registry()
+                                        .into_iter()
+                                        .map(|(cid, _, _)| cid)
+                                        .collect();
+                                    match crate::swap::validate_swap_intent(&intent, &known) {
+                                        Ok(()) => match db.insert_intent(&intent) {
+                                            Ok(()) => tracing::info!(
+                                                intent_id = %intent.intent_id,
+                                                "stored inbound swap intent"
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                intent_id = %intent.intent_id,
+                                                "failed to store inbound intent: {e}"
+                                            ),
+                                        },
+                                        Err(e) => tracing::warn!(
+                                            intent_id = %intent.intent_id,
+                                            "rejected inbound intent: {e}"
+                                        ),
+                                    }
+                                }
+                                Err(e) => tracing::warn!(err = %e, "malformed inbound intent payload"),
+                            }
+                        }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         let mut st = status.write().await;

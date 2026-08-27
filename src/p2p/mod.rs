@@ -65,17 +65,32 @@ impl Default for P2pConfig {
     }
 }
 
-/// Message broadcast over the `/psob/intents/v1` gossip topic.
+/// Message broadcast over the `/psob/intents/v1` gossip topic, conforming to
+/// the `psob-swap/1` order-book standard.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SwapIntentMessage {
+    /// Standard identifier, e.g. `"psob-swap"`.
+    pub protocol: String,
+    /// Standard version, e.g. `1`.
+    pub version: u32,
     pub intent_id: String,
+    /// Maker's compressed secp256k1 pubkey (hex), authoring & signing the offer.
+    pub maker_pubkey: String,
+    /// Chain the maker gives/sells (AuxPoW `nVersion >> 16`).
     pub from_chain: u32,
+    /// Chain the maker wants/buys.
     pub to_chain: u32,
     pub from_amount: u64,
     pub to_amount: u64,
-    pub maker_address: String,
-    pub desired_address: String,
+    /// Address (on `to_chain`) where the maker receives `to_amount`.
+    pub maker_receive_address: String,
+    /// Unix seconds the intent was created.
     pub timestamp: u64,
+    /// Unix seconds after which the intent is invalid.
+    pub expiry: u64,
+    /// Settlement protocol the maker supports, e.g. `"adaptor-v1"`.
+    pub settlement: String,
+    /// Compact 64-byte ECDSA secp256k1 signature over the intent (hex).
     pub signature: String,
 }
 

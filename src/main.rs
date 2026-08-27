@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Database::open(&config.db_path)?);
 
     // P2P is optional: if the swarm fails to start, the node still serves REST.
-    let (p2p_handle, p2p_task) = match start_p2p_swarm(config.p2p.clone()).await {
+    let (p2p_handle, p2p_task) = match start_p2p_swarm(config.p2p.clone(), db.clone()).await {
         Ok((h, task)) => {
             tracing::info!("p2p gossip mesh enabled");
             (Some(h), Some(tokio::spawn(task)))

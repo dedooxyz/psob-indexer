@@ -40,6 +40,8 @@ use std::sync::Arc;
 
 use common::BlockHeader;
 
+use crate::p2p::SwapIntentMessage;
+
 /// Bump whenever the on-disk record layout changes. On a mismatch the DB is
 /// refuse-to-open (it is a disposable cache — delete and re-ingest).
 pub const SCHEMA_VERSION: u32 = 2;
@@ -52,6 +54,7 @@ const TABLE_PARENT_BLOCKS: TableDefinition<&[u8; 32], &[u8]> =
 const TABLE_SIBLING_INDEX: TableDefinition<(&[u8; 32], u32, u64), ()> =
     TableDefinition::new("sibling_index");
 const TABLE_META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+const TABLE_SWAP_INTENTS: TableDefinition<&str, &str> = TableDefinition::new("swap_intents");
 
 /// A raw stored aux-chain record. `wire_hex` is the full 80-byte header +
 /// CAuxPow payload (self-verifiable); the parsed `header` is derived from the
@@ -150,6 +153,7 @@ pub struct Database {
     cache_parents: DashMap<[u8; 32], StoredParent>,
     cache_siblings: DashMap<[u8; 32], Vec<StoredBlock>>,
     cache_meta: DashMap<String, String>,
+    cache_intents: DashMap<String, SwapIntentMessage>,
 }
 
 impl Database {
@@ -168,6 +172,9 @@ impl Database {
                 .open_table(TABLE_SIBLING_INDEX)
                 .context("open sibling_index")?;
             let _ = write_txn.open_table(TABLE_META).context("open meta")?;
+            let _ = write_txn
+                .open_table(TABLE_SWAP_INTENTS)
+                .context("open swap_intents")?;
         }
         // Schema gate BEFORE any read: refuse to half-load an incompatible DB.
         {
@@ -197,6 +204,7 @@ impl Database {
             cache_parents: DashMap::new(),
             cache_siblings: DashMap::new(),
             cache_meta: DashMap::new(),
+            cache_intents: DashMap::new(),
         };
         db.warm_up_cache().context("warm up ram cache")?;
         Ok(db)
@@ -211,6 +219,15 @@ impl Database {
                 let (k, v) = row?;
                 self.cache_meta
                     .insert(k.value().to_string(), v.value().to_string());
+            }
+        }
+
+        if let Ok(table) = read_txn.open_table(TABLE_SWAP_INTENTS) {
+            for row in table.iter()? {
+                let (k, v) = row?;
+                if let Ok(intent) = serde_json::from_str::<SwapIntentMessage>(v.value()) {
+                    self.cache_intents.insert(k.value().to_string(), intent);
+                }
             }
         }
 
@@ -251,6 +268,13 @@ impl Database {
     pub fn upsert_chain(&self, chain_id: u32, name: &str, electrs: &str) -> anyhow::Result<()> {
         let key = format!("chain.{chain_id}");
         let val = format!("{name}|{electrs}");
+        // Skip the Redb commit entirely when the cached value is unchanged —
+        // otherwise every ingest tick writes a txn even though this rarely moves.
+        if let Some(existing) = self.get_meta(&key)? {
+            if existing == val {
+                return Ok(());
+            }
+        }
         self.set_meta(&key, &val)
     }
 
@@ -269,6 +293,97 @@ impl Database {
                 }
             })
             .collect()
+    }
+
+    // ─── swap intents (psob-swap/1 order book) ────────────────────────────────
+
+    fn now_unix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Store a validated swap intent. Expired entries are pruned lazily first.
+    pub fn insert_intent(&self, intent: &SwapIntentMessage) -> anyhow::Result<()> {
+        self.prune_expired_intents()?;
+        let json = serde_json::to_string(intent)?;
+        self.cache_intents
+            .insert(intent.intent_id.clone(), intent.clone());
+        let write_txn = self.redb.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TABLE_SWAP_INTENTS)?;
+            table.insert(intent.intent_id.as_str(), json.as_str())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// List non-expired intents, filtered by chain pair / protocol, newest first.
+    /// Returns the page items and the total non-expired count (for pagination).
+    pub fn list_intents(
+        &self,
+        from: Option<u32>,
+        to: Option<u32>,
+        protocol: Option<&str>,
+        page: Page,
+    ) -> anyhow::Result<(Vec<SwapIntentMessage>, usize)> {
+        self.prune_expired_intents()?;
+        let now = Self::now_unix();
+        let mut all: Vec<SwapIntentMessage> = self
+            .cache_intents
+            .iter()
+            .map(|e| e.value().clone())
+            .filter(|i| i.expiry > now)
+            .filter(|i| match from {
+                Some(f) => i.from_chain == f,
+                None => true,
+            })
+            .filter(|i| match to {
+                Some(t) => i.to_chain == t,
+                None => true,
+            })
+            .filter(|i| match protocol {
+                Some(p) => i.protocol == p,
+                None => true,
+            })
+            .collect();
+        all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        let total = all.len();
+        let items = all
+            .into_iter()
+            .skip(page.offset)
+            .take(page.limit)
+            .collect();
+        Ok((items, total))
+    }
+
+    /// Drop intents whose `expiry` has passed. Returns the number removed.
+    pub fn prune_expired_intents(&self) -> anyhow::Result<usize> {
+        let now = Self::now_unix();
+        let expired: Vec<String> = self
+            .cache_intents
+            .iter()
+            .filter(|e| e.value().expiry <= now)
+            .map(|e| e.key().clone())
+            .collect();
+        let n = expired.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        let write_txn = self.redb.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TABLE_SWAP_INTENTS)?;
+            for id in &expired {
+                table.remove(id.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+        for id in &expired {
+            self.cache_intents.remove(id);
+        }
+        Ok(n)
     }
 
     pub fn get_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -688,7 +803,7 @@ impl Database {
         min_legs: usize,
         page: Page,
         chain_filter: Option<u32>,
-    ) -> anyhow::Result<Vec<SharedParent>> {
+    ) -> anyhow::Result<(Vec<SharedParent>, usize)> {
         let mut out = Vec::new();
         for entry in self.cache_parents.iter() {
             let p = entry.value();
@@ -727,12 +842,14 @@ impl Database {
                 .cmp(&a.legs.len())
                 .then_with(|| b.ltc_height.cmp(&a.ltc_height))
         });
-        Ok(out.into_iter().skip(page.offset).take(page.limit).collect())
+        let total = out.len();
+        let items = out.into_iter().skip(page.offset).take(page.limit).collect();
+        Ok((items, total))
     }
 
     /// Latest sibling group (highest LTC height with >= min_legs legs).
     pub fn latest_sibling_group(&self, min_legs: usize) -> anyhow::Result<Option<SharedParent>> {
-        let mut out = self.shared_mainnet_parents(min_legs, Page::new(Some(1), Some(0)), None)?;
+        let (mut out, _) = self.shared_mainnet_parents(min_legs, Page::new(Some(1), Some(0)), None)?;
         Ok(out.pop())
     }
 
@@ -745,7 +862,7 @@ impl Database {
         ltc_end: u64,
         chain_filter: Option<u32>,
         page: Page,
-    ) -> anyhow::Result<Vec<EpochRow>> {
+    ) -> anyhow::Result<(Vec<EpochRow>, usize)> {
         let mut out = Vec::new();
         for entry in self.cache_parents.iter() {
             let p = entry.value();
@@ -762,7 +879,9 @@ impl Database {
             }
         }
         out.sort_by_key(|item| (item.2, item.0, item.1));
-        Ok(out.into_iter().skip(page.offset).take(page.limit).collect())
+        let total = out.len();
+        let items = out.into_iter().skip(page.offset).take(page.limit).collect();
+        Ok((items, total))
     }
 
     // ─── stats ───────────────────────────────────────────────────────────────
@@ -923,17 +1042,57 @@ mod tests {
         let ltc_h = 347_000;
         db.classify_parent(&parent_hash, Some(ltc_h))
             .expect("classify");
-        let groups = db.shared_mainnet_parents(2, Page::default(), None).unwrap();
+        let (groups, _) = db.shared_mainnet_parents(2, Page::default(), None).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].ltc_height, ltc_h);
         assert_eq!(groups[0].legs.len(), 2);
 
         // Epoch window (LTC heights) is inclusive and filterable by chain.
-        let epoch = db
+        let (epoch, _) = db
             .epoch_blocks(ltc_h, ltc_h, Some(DINGO), Page::default())
             .unwrap();
         assert_eq!(epoch.len(), 1);
         assert_eq!(epoch[0].0, DINGO);
+    }
+
+    #[test]
+    fn swap_intent_store_and_list() {
+        let dir = tempfile_dir();
+        let db = Database::open(&dir).expect("open");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mk = |id: &str, from: u32, to: u32, expiry: u64| SwapIntentMessage {
+            protocol: "psob-swap".into(),
+            version: 1,
+            intent_id: id.into(),
+            maker_pubkey: "02".repeat(33),
+            from_chain: from,
+            to_chain: to,
+            from_amount: 1_0000_0000,
+            to_amount: 2_0000_0000,
+            maker_receive_address: "addr".into(),
+            timestamp: 1_000,
+            expiry,
+            settlement: "adaptor-v1".into(),
+            signature: "00".repeat(64),
+        };
+        db.insert_intent(&mk("a", 8224, 50, now + 1000)).unwrap();
+        db.insert_intent(&mk("b", 8224, 50, now + 1000)).unwrap();
+        db.insert_intent(&mk("c", 50, 8224, now - 10)).unwrap(); // already expired
+
+        let (all, total) = db.list_intents(None, None, None, Page::default()).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(all.len(), 2);
+
+        let (filtered, _) = db.list_intents(Some(8224), Some(50), None, Page::default()).unwrap();
+        assert_eq!(filtered.len(), 2);
+        let (other, _) = db.list_intents(Some(50), Some(8224), None, Page::default()).unwrap();
+        assert_eq!(other.len(), 0);
+
+        // Expired entry is gone after prune-on-list.
+        assert!(db.cache_intents.get("c").is_none());
     }
 
     #[test]

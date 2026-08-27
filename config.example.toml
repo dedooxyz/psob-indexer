@@ -28,6 +28,9 @@ db_path = "psob-indexer.redb"
 [resolver]
 base = "https://litecoinspace.org/api"
 api_key = ""
+# Parent chain slug — validated at startup (lowercased; must be "litecoin" or
+# "bitcoin"). A typo silently mis-classifies parents as "trial", so it fails
+# loudly instead of failing quiet.
 parent_chain = "litecoin"
 # fallback_base = "https://another-explorer.example/api"
 

@@ -488,18 +488,92 @@ fn proof_from_stored(state: &AppState, block: &StoredBlock) -> anyhow::Result<Pr
 
 // ─── routes ───────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Deserialize)]
+pub struct SwapIntentQuery {
+    pub from: Option<u32>,
+    pub to: Option<u32>,
+    pub protocol: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/swap/intents",
+    tag = "swap",
+    responses((status = 200, description = "Intent accepted & stored", body = serde_json::Value))
+)]
+async fn create_swap_intent(
+    State(state): State<AppState>,
+    Json(intent): Json<SwapIntentMessage>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let known: std::collections::HashSet<u32> = state
+        .db
+        .chain_registry()
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    crate::swap::validate_swap_intent(&intent, &known)
+        .map_err(|e| ApiError::BadRequest(format!("invalid swap intent: {e}")))?;
+    state
+        .db
+        .insert_intent(&intent)
+        .map_err(|e| ApiError::Internal(format!("could not store intent: {e}")))?;
+    if let Some(handle) = &state.p2p {
+        handle.broadcast_intent(intent.clone()).await;
+    }
+    Ok(Json(json!({"status": "accepted", "intent_id": intent.intent_id})))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/swap/intents",
+    tag = "swap",
+    params(
+        ("from" = Option<u32>, Query, description = "Filter by from_chain"),
+        ("to" = Option<u32>, Query, description = "Filter by to_chain"),
+        ("protocol" = Option<String>, Query, description = "Filter by protocol"),
+        ("limit" = Option<usize>, Query, description = "Max items per page (default 20, max 200)"),
+        ("offset" = Option<usize>, Query, description = "Skip this many items")
+    ),
+    responses((status = 200, description = "Paged swap intents", body = serde_json::Value))
+)]
+async fn list_swap_intents(
+    State(state): State<AppState>,
+    Query(q): Query<SwapIntentQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let page = Page::new(q.limit, q.offset);
+    let (items, total) = state
+        .db
+        .list_intents(q.from, q.to, q.protocol.as_deref(), page)
+        .map_err(|e| ApiError::Internal(format!("could not list intents: {e}")))?;
+    Ok(Json(json!({"total": total, "intents": items})))
+}
+
 pub fn create_router(state: AppState) -> Router {
     let cors = if state.config.cors_origins.iter().any(|o| o == "*") {
         CorsLayer::permissive()
     } else {
-        CorsLayer::new().allow_origin(
-            state
-                .config
-                .cors_origins
-                .iter()
-                .map(|o| o.parse().expect("configured CORS origin must parse"))
-                .collect::<Vec<_>>(),
-        )
+        // A single malformed origin must NOT panic the whole server at boot.
+        // Skip invalid entries (logged) and fail *closed* (deny all cross-origin)
+        // if nothing valid remains, rather than silently allowing everything.
+        let origins: Vec<axum::http::HeaderValue> = state
+            .config
+            .cors_origins
+            .iter()
+            .filter_map(|o| match o.parse::<axum::http::HeaderValue>() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(origin = %o, err = %e, "skipping invalid CORS origin");
+                    None
+                }
+            })
+            .collect();
+        if origins.is_empty() {
+            CorsLayer::new()
+        } else {
+            CorsLayer::new().allow_origin(origins)
+        }
     };
 
     let metrics = Arc::clone(&state.metrics);
@@ -544,6 +618,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/p2p/status", get(p2p_status_handler))
         .route("/api/v1/p2p/peers", get(p2p_peers_handler))
         .route("/api/v1/p2p/broadcast", post(p2p_broadcast_handler))
+        .route("/api/v1/swap/intents", get(list_swap_intents))
+        .route("/api/v1/swap/intents", post(create_swap_intent))
         .with_state(state);
     let docs: Router<()> = utoipa_swagger_ui::SwaggerUi::new("/docs")
         .url("/api/v1/openapi.json", openapi_doc())
@@ -626,7 +702,7 @@ async fn siblings_handler(
     Query(q): Query<SiblingQuery>,
 ) -> Result<Json<Paged<SiblingSummary>>, ApiError> {
     let page = Page::new(q.limit, q.offset);
-    let parents = state
+    let (parents, total) = state
         .db
         .shared_mainnet_parents(q.min_legs.unwrap_or(2), page, q.chain_id)?;
     let items: Vec<SiblingSummary> = parents
@@ -648,10 +724,6 @@ async fn siblings_handler(
                 .collect(),
         })
         .collect();
-    let total = state
-        .db
-        .shared_mainnet_parents(1, Page::default(), None)?
-        .len();
     Ok(Json(paged(total, page, items)))
 }
 
@@ -818,10 +890,7 @@ async fn epoch_handler(
         return Err(ApiError::BadRequest("ltc_start must be <= ltc_end".into()));
     }
     let page = Page::new(q.limit, q.offset);
-    let all = state
-        .db
-        .epoch_blocks(ltc_start, ltc_end, q.chain_id, Page::default())?;
-    let blocks = state
+    let (blocks, total) = state
         .db
         .epoch_blocks(ltc_start, ltc_end, q.chain_id, page)?;
     let items: Vec<EpochBlockItem> = blocks
@@ -836,7 +905,7 @@ async fn epoch_handler(
     Ok(Json(EpochResponse {
         ltc_start,
         ltc_end,
-        total_blocks: all.len(),
+        total_blocks: total,
         limit: page.limit,
         offset: page.offset,
         blocks: items,

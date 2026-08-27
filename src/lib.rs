@@ -25,6 +25,7 @@ pub mod metrics;
 pub mod p2p;
 pub mod resolve;
 pub mod server;
+pub mod swap;
 pub mod verify;
 
 pub use config::{AuxChain, Config};

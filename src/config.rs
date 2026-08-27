@@ -156,6 +156,42 @@ struct P2pFile {
     disable_mdns: Option<bool>,
 }
 
+/// Known parent-chain slugs for the resolver.
+///
+/// The parent is identified by a *free-text* slug (`PSOB_PARENT_CHAIN`), not a
+/// numeric id, and is interpolated straight into the explorer URL
+/// (`{base}/{slug}/block/{hash}`). A typo'd or wrong-cased slug therefore
+/// builds a wrong URL and silently mis-classifies parents as "trial" — breaking
+/// epoch anchors with no error. We validate it loudly at startup instead of
+/// failing quietly.
+pub const KNOWN_PARENT_CHAINS: &[&str] = &["litecoin", "bitcoin"];
+
+/// Normalize + validate the parent-chain slug. Lowercases/trims and rejects
+/// anything not in [`KNOWN_PARENT_CHAINS`], so a spelling/case mistake fails
+/// fast instead of poisoning parent classification.
+fn normalize_parent_chain(slug: String) -> anyhow::Result<String> {
+    let norm = slug.trim().to_lowercase();
+    if !KNOWN_PARENT_CHAINS.contains(&norm.as_str()) {
+        anyhow::bail!(
+            "unknown PSOB_PARENT_CHAIN {slug:?}; must be one of: {}",
+            KNOWN_PARENT_CHAINS.join(", ")
+        );
+    }
+    Ok(norm)
+}
+
+/// Display-only ticker. Trims; an empty name is derived from the (authoritative)
+/// AuxPoW `chain_id`, reinforcing that the numeric id is the canonical key — not
+/// the human label — for every lookup.
+fn normalize_chain_name(name: &str, chain_id: u32) -> String {
+    let n = name.trim().to_string();
+    if n.is_empty() {
+        format!("chain{chain_id}")
+    } else {
+        n
+    }
+}
+
 impl Config {
     /// Load config: `.env` → optional TOML file → environment overrides.
     pub fn load() -> anyhow::Result<Self> {
@@ -190,6 +226,7 @@ impl Config {
         let parent_chain = env_var("PSOB_PARENT_CHAIN")?
             .or_else(|| file.as_ref().and_then(|f| f.resolver.parent_chain.clone()))
             .unwrap_or_else(|| "litecoin".to_string());
+        let parent_chain = normalize_parent_chain(parent_chain)?;
         let fallback_base = env_first(&["PSOB_PARENT_ELECTRS_FALLBACK", "PSOB_CCNODES_FALLBACK_BASE"])?
             .or_else(|| file.as_ref().and_then(|f| f.resolver.fallback_base.clone()))
             .filter(|b| !b.is_empty());
@@ -316,13 +353,30 @@ fn parse_chain_specs(raw: &str) -> anyhow::Result<Vec<AuxChain>> {
         let start_height = parts.next().and_then(|s| s.parse().ok());
         chains.push(AuxChain {
             chain_id,
-            name: name.to_string(),
+            name: normalize_chain_name(name, chain_id),
             electrs,
             pow_limit_bits,
             start_height,
         });
     }
+    check_unique_chain_ids(&chains)?;
     Ok(chains)
+}
+
+/// Two chains sharing a `chain_id` would spawn two ingest tasks writing to the
+/// same `(chain_id, height)` Redb table and clobber each other. Reject that at
+/// parse time so the misconfiguration fails loudly, not silently.
+fn check_unique_chain_ids(chains: &[AuxChain]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for c in chains {
+        if !seen.insert(c.chain_id) {
+            anyhow::bail!(
+                "duplicate chain_id {id} in PSOB_CHAINS / [chains] — each chain needs a unique AuxPoW id",
+                id = c.chain_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_file_chains(entries: &[ChainEntry]) -> anyhow::Result<Vec<AuxChain>> {
@@ -338,12 +392,13 @@ fn parse_file_chains(entries: &[ChainEntry]) -> anyhow::Result<Vec<AuxChain>> {
             })?;
         chains.push(AuxChain {
             chain_id: e.chain_id,
-            name: e.name.clone(),
+            name: normalize_chain_name(&e.name, e.chain_id),
             electrs: e.electrs_url.trim_end_matches('/').to_string(),
             pow_limit_bits,
             start_height: e.start_height,
         });
     }
+    check_unique_chain_ids(&chains)?;
     Ok(chains)
 }
 
@@ -465,5 +520,31 @@ mod tests {
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].chain_id, 8224);
         assert_eq!(chains[0].start_height, Some(1095300));
+    }
+
+    #[test]
+    fn parent_chain_slug_is_normalized_and_validated() {
+        // Wrong case / whitespace is accepted and normalized.
+        assert_eq!(
+            normalize_parent_chain("  Litecoin ".into()).unwrap(),
+            "litecoin"
+        );
+        // Unknown slug fails loudly instead of silently mis-resolving.
+        assert!(normalize_parent_chain("ltccoin".into()).is_err());
+        assert!(normalize_parent_chain("BITCOIN".into()).is_ok());
+    }
+
+    #[test]
+    fn chain_name_is_trimmed_and_derived_when_empty() {
+        assert_eq!(normalize_chain_name("  JKC ", 8224), "JKC");
+        // Empty name falls back to the numeric chain id (the canonical key).
+        assert_eq!(normalize_chain_name("", 8224), "chain8224");
+    }
+
+    #[test]
+    fn rejects_duplicate_chain_ids() {
+        let specs = "JKC|8224|https://a|0x1e0fffff,DINGO|8224|https://b|0x1e0fffff";
+        let err = parse_chain_specs(specs).unwrap_err();
+        assert!(err.to_string().contains("duplicate chain_id"));
     }
 }
