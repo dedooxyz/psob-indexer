@@ -1095,6 +1095,9 @@ mod tests {
             timestamp: 1_000,
             expiry,
             settlement: "adaptor-v1".into(),
+            adaptor_point: String::new(),
+            maker_npub: String::new(),
+            maker_refund_address: String::new(),
             signature: "00".repeat(64),
         };
         db.insert_intent(&mk("a", 8224, 50, now + 1000)).unwrap();

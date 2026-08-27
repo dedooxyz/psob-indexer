@@ -61,6 +61,14 @@ pub fn validate_swap_intent(
     if pk.len() != 33 {
         anyhow::bail!("maker_pubkey must be 33 bytes (compressed secp256k1)");
     }
+    // adaptor_point: optional, but if present must be a compressed secp256k1
+    // point (33 bytes = 66 hex). Full curve validation happens client-side.
+    if !intent.adaptor_point.is_empty() {
+        let ap = hex::decode(&intent.adaptor_point).map_err(|_| anyhow::anyhow!("adaptor_point not hex"))?;
+        if ap.len() != 33 {
+            anyhow::bail!("adaptor_point must be 33 bytes (compressed secp256k1)");
+        }
+    }
     // signature: compact 64-byte ECDSA = 128 hex chars.
     let sig = hex::decode(&intent.signature).map_err(|_| anyhow::anyhow!("signature not hex"))?;
     if sig.len() != 64 {
@@ -88,7 +96,7 @@ fn canonical_intent_json(intent: &SwapIntentMessage) -> String {
         out
     }
     format!(
-        "{{\"protocol\":\"{}\",\"version\":{},\"intent_id\":\"{}\",\"maker_pubkey\":\"{}\",\"from_chain\":{},\"to_chain\":{},\"from_amount\":{},\"to_amount\":{},\"maker_receive_address\":\"{}\",\"timestamp\":{},\"expiry\":{},\"settlement\":\"{}\"}}",
+        "{{\"protocol\":\"{}\",\"version\":{},\"intent_id\":\"{}\",\"maker_pubkey\":\"{}\",\"from_chain\":{},\"to_chain\":{},\"from_amount\":{},\"to_amount\":{},\"maker_receive_address\":\"{}\",\"adaptor_point\":\"{}\",\"maker_npub\":\"{}\",\"maker_refund_address\":\"{}\",\"timestamp\":{},\"expiry\":{},\"settlement\":\"{}\"}}",
         esc(&intent.protocol),
         intent.version,
         esc(&intent.intent_id),
@@ -98,6 +106,9 @@ fn canonical_intent_json(intent: &SwapIntentMessage) -> String {
         intent.from_amount,
         intent.to_amount,
         esc(&intent.maker_receive_address),
+        esc(&intent.adaptor_point),
+        esc(&intent.maker_npub),
+        esc(&intent.maker_refund_address),
         intent.timestamp,
         intent.expiry,
         esc(&intent.settlement),
@@ -193,6 +204,9 @@ mod tests {
             timestamp: 1_700_000_000,
             expiry: 1_700_000_000 + 86_400,
             settlement: "adaptor-v1".into(),
+            adaptor_point: String::new(),
+            maker_npub: String::new(),
+            maker_refund_address: String::new(),
             signature: String::new(),
         }
     }
@@ -210,10 +224,13 @@ mod tests {
         // output byte-for-byte — it is the cross-implementation contract.
         let intent = SwapIntentMessage {
             maker_pubkey: "02abcdef".into(),
+            adaptor_point: "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            maker_npub: "npub1testmakernegotiationkeyexample000000000000000000000000000000".into(),
+            maker_refund_address: "MAKERREFUNDADDRESS".into(),
             ..base_intent()
         };
         let got = canonical_intent_json(&intent);
-        let expected = "{\"protocol\":\"psob-swap\",\"version\":1,\"intent_id\":\"test-intent-1\",\"maker_pubkey\":\"02abcdef\",\"from_chain\":8211,\"to_chain\":63,\"from_amount\":1000000,\"to_amount\":2000000,\"maker_receive_address\":\"LUCKYRECEIVEADDRESS\",\"timestamp\":1700000000,\"expiry\":1700086400,\"settlement\":\"adaptor-v1\"}";
+        let expected = "{\"protocol\":\"psob-swap\",\"version\":1,\"intent_id\":\"test-intent-1\",\"maker_pubkey\":\"02abcdef\",\"from_chain\":8211,\"to_chain\":63,\"from_amount\":1000000,\"to_amount\":2000000,\"maker_receive_address\":\"LUCKYRECEIVEADDRESS\",\"adaptor_point\":\"02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"maker_npub\":\"npub1testmakernegotiationkeyexample000000000000000000000000000000\",\"maker_refund_address\":\"MAKERREFUNDADDRESS\",\"timestamp\":1700000000,\"expiry\":1700086400,\"settlement\":\"adaptor-v1\"}";
         assert_eq!(got, expected);
     }
 

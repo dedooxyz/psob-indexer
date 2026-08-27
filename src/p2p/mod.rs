@@ -90,6 +90,18 @@ pub struct SwapIntentMessage {
     pub expiry: u64,
     /// Settlement protocol the maker supports, e.g. `"adaptor-v1"`.
     pub settlement: String,
+    /// Maker's adaptor point `T = t·G` (hex, 33-byte compressed), used by the
+    /// taker to build the encrypted (adaptor) signature. Empty if absent.
+    #[serde(default)]
+    pub adaptor_point: String,
+    /// Maker's Nostr npub (bech32) for out-of-band negotiation (accept/funded/
+    /// claim messages). Empty if the indexer is the sole transport.
+    #[serde(default)]
+    pub maker_npub: String,
+    /// Address (on `from_chain`) where the maker can claim a refund after the
+    /// timelock. Distinct from `maker_receive_address`. Empty if absent.
+    #[serde(default)]
+    pub maker_refund_address: String,
     /// Compact 64-byte ECDSA secp256k1 signature over the intent (hex).
     pub signature: String,
 }
