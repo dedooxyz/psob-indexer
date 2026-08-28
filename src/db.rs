@@ -305,9 +305,14 @@ impl Database {
             .unwrap_or(0)
     }
 
+    pub const MAX_ACTIVE_INTENTS: usize = 20_000;
+
     /// Store a validated swap intent. Expired entries are pruned lazily first.
     pub fn insert_intent(&self, intent: &SwapIntentMessage) -> anyhow::Result<()> {
         self.prune_expired_intents()?;
+        if self.cache_intents.len() >= Self::MAX_ACTIVE_INTENTS {
+            anyhow::bail!("Swap intent orderbook is at maximum capacity ({})", Self::MAX_ACTIVE_INTENTS);
+        }
         let json = serde_json::to_string(intent)?;
         self.cache_intents
             .insert(intent.intent_id.clone(), intent.clone());
@@ -643,9 +648,23 @@ impl Database {
         for ((c, h), _) in to_remove {
             self.cache_blocks.remove(&(c, h));
         }
+        let mut empty_parents: Vec<[u8; 32]> = Vec::new();
         for ph in removed_parents {
             if let Some(mut list) = self.cache_siblings.get_mut(&ph) {
                 list.retain(|b| !(b.chain_id == chain_id && b.height >= from_height));
+                if list.is_empty() {
+                    empty_parents.push(ph);
+                }
+            }
+        }
+        for ph in empty_parents {
+            self.cache_siblings.remove(&ph);
+            self.cache_parents.remove(&ph);
+            if let Ok(write_txn) = self.redb.begin_write() {
+                if let Ok(mut table_parents) = write_txn.open_table(TABLE_PARENT_BLOCKS) {
+                    let _ = table_parents.remove(&ph);
+                }
+                let _ = write_txn.commit();
             }
         }
 

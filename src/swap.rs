@@ -117,18 +117,20 @@ fn canonical_intent_json(intent: &SwapIntentMessage) -> String {
 
 /// Verify the maker's signature over the intent.
 ///
-/// Gated behind `PSOB_REQUIRE_SIGNATURES=1` (default off, so the order book
-/// still accepts unsigned intents from clients that don't yet sign). When on,
-/// the maker's compact ECDSA signature over `SHA256(canonical JSON without
-/// signature)` must verify against `maker_pubkey`.
+/// Enforcement is ON by default: the maker's compact ECDSA signature over
+/// `SHA256(canonical JSON without signature)` must verify against
+/// `maker_pubkey`. It can be relaxed during rollout with
+/// `PSOB_REQUIRE_SIGNATURES=0` (or `false`), but unsigned intents must never be
+/// accepted in production — an unsigned intent lets anyone forge an order-book
+/// entry in someone else's name.
 pub fn verify_intent_signature(intent: &SwapIntentMessage) -> anyhow::Result<()> {
     let enforce = std::env::var("PSOB_REQUIRE_SIGNATURES")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     if !enforce {
         tracing::warn!(
             intent_id = %intent.intent_id,
-            "swap intent signature NOT verified (set PSOB_REQUIRE_SIGNATURES=1 to enforce)"
+            "swap intent signature NOT verified (PSOB_REQUIRE_SIGNATURES relaxed — do not run unsigned in production)"
         );
         return Ok(());
     }

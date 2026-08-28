@@ -30,8 +30,16 @@ pub const CHAIN_POW_LIMIT_BITS: u32 = 0x1e0f_ffff;
 /// the standard compact powLimit for the whole scrypt/AuxPoW family (LTC, DOGE,
 /// JKC…). The PSob guest checks the single verified LTC parent's expanded target
 /// against this floor, and the contract pins it. Per-chain powLimits that differ
-/// (e.g. a chain that forked its own limit) are handled on-chain per `chainId`.
+///       (e.g. a chain that forked its own limit) are handled on-chain per `chainId`.
 pub const LTC_POW_LIMIT_BITS: u32 = 0x1e0f_ffff;
+
+/// Litecoin **mainnet** AuxPoW parent chain id (`nVersion >> 16 == 0x2000`). Junkcoin
+/// (and its sibling chains served by this indexer) are merge-mined only under LTC
+/// mainnet, so a valid AuxPoW parent header MUST carry this id. `verify_auxpow_commitment`
+/// enforces it so a self-mined diff-1 scrypt chain (or Dogecoin) cannot be presented as
+/// the parent. NOTE: this indexer does NOT verify scrypt PoW (that is the guest's job);
+/// this pin only keeps `valid:true` honest about which chain actually anchors the work.
+pub const LTC_CHAIN_ID: u32 = 8192;
 
 /// Merged-mining magic that precedes the aux-chain merkle root in the parent
 /// coinbase: `fa be 6d 6d`.
@@ -122,6 +130,11 @@ impl AuxPow {
 ///   3. **strict chain id:** the parent block must NOT belong to our aux chain
 ///      (`parent.GetChainId() != chain_id`) — `CAuxPow::check`'s `fStrictChainId`
 ///      guard, stopping a chain from merge-mining itself;
+///   3b. **the parent MUST be Litecoin mainnet** (`parent.GetChainId() ==
+///       LTC_CHAIN_ID == 8192`). Junkcoin and its siblings are merge-mined only under
+///       LTC, so any other parent id (self-mined diff-1 scrypt chain, Dogecoin, …) is
+///       rejected. This is the anchor that ties the bridge's peg-in security to LTC
+///       hashrate.
 ///   4. **anti-grind:** the 4-byte size right after the root equals `2^height`, and
 ///      the 4-byte nonce after that pins `chain_index == getExpectedIndex(nonce,
 ///      chain_id, height)` — so one parent block commits each chain at exactly one
@@ -134,11 +147,13 @@ pub fn verify_auxpow_commitment(aux_block_hash: &[u8; 32], aux: &AuxPow, chain_i
     if aux.parent_index != 0 {
         return false;
     }
-    // Strict chain id: the parent (scrypt-mined, e.g. Litecoin) must not claim our
-    // aux chain id. Enforced unconditionally — a legitimate parent always differs, so
-    // this is at most stricter than consensus and never rejects a valid block.
+    // Strict chain id: the parent (scrypt-mined) must NOT claim our aux chain id AND
+    // MUST be Litecoin mainnet. Enforced unconditionally. A legitimate JKC/DINGO/… parent
+    // is always LTC (id 8192) and always differs from the aux chain, so this is at most
+    // stricter than consensus and never rejects a valid block. Without the LTC pin a
+    // prover could supply a self-mined diff-1 scrypt chain (or DOGE) as the parent.
     match aux.parent_chain_id() {
-        Some(pid) if pid != chain_id => {}
+        Some(pid) if pid != chain_id && pid == LTC_CHAIN_ID => {}
         _ => return false,
     }
     let Some(parent_root) = aux.parent_merkle_root() else {
@@ -186,7 +201,10 @@ pub fn verify_auxpow_commitment(aux_block_hash: &[u8; 32], aux: &AuxPow, chain_i
 /// JunkCoin's deterministic aux-chain slot — a pseudo-random index fixed by the
 /// (nonce, chain_id, height) triple, so the same parent work can't be reused for the
 /// same chain at a different slot. Verbatim port of `CAuxPow::getExpectedIndex`.
-fn get_expected_index(nonce: u32, chain_id: u32, height: u32) -> u32 {
+///
+/// `pub` so downstream verifiers (e.g. the indexer) reuse the single canonical
+/// implementation rather than duplicating the LCG and risking divergence.
+pub fn get_expected_index(nonce: u32, chain_id: u32, height: u32) -> u32 {
     let mut rand = nonce;
     rand = rand.wrapping_mul(1103515245).wrapping_add(12345);
     rand = rand.wrapping_add(chain_id);
@@ -1283,6 +1301,9 @@ mod tests {
         let parent_sib = [0x33u8; 32];
         let parent_root = merkle_fold_branch(&cb_txid, &[parent_sib], 0);
         let mut parent_header = alloc::vec![0u8; 80];
+        // Parent MUST be Litecoin mainnet (chain id 8192): Junkcoin is merge-mined only
+        // under LTC. nVersion >> 16 == 8192.
+        parent_header[0..4].copy_from_slice(&(LTC_CHAIN_ID << 16).to_le_bytes());
         parent_header[36..68].copy_from_slice(&parent_root);
 
         let aux = AuxPow {
@@ -1390,7 +1411,10 @@ mod tests {
             let cb_txid = sha256d(&coinbase);
 
             let mut parent = alloc::vec![0u8; 80];
-            parent[4..36].copy_from_slice(&[0x55; 32]); // arbitrary foreign chain link
+            // Parent MUST be Litecoin mainnet (chain id 8192): Junkcoin is merge-mined
+            // only under LTC. nVersion >> 16 == 8192.
+            parent[0..4].copy_from_slice(&(LTC_CHAIN_ID << 16).to_le_bytes());
+            parent[4..36].copy_from_slice(&[0x55; 32]); // arbitrary foreign prev-hash
             parent[36..68].copy_from_slice(&cb_txid); // coinbase IS the merkle root
             parent[72..76].copy_from_slice(&bits.to_le_bytes());
 

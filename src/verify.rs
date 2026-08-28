@@ -279,6 +279,17 @@ fn verify_proof1(aux: &AuxPow, chain_id: u32) -> StepResult {
             ));
         }
     }
+    // Anchor the parent to Litecoin mainnet (chain id 8192). Junkcoin and its siblings
+    // are merge-mined only under LTC; without this pin `valid:true` would bless a
+    // self-mined diff-1 scrypt chain (or Dogecoin) as a legitimate parent, which does not
+    // anchor the bridge's economic security. (This indexer still does NOT verify scrypt
+    // PoW — that is the guest's job — but the parent-chain pin keeps the verdict honest.)
+    if aux.parent_chain_id() != Some(common::LTC_CHAIN_ID) {
+        return StepResult::err(format!(
+            "parent chain id {:?} is not Litecoin mainnet (8192)",
+            aux.parent_chain_id()
+        ));
+    }
     let Some(parent_root) = aux.parent_merkle_root() else {
         return StepResult::err("parent header too short for merkle root");
     };
@@ -299,6 +310,20 @@ fn verify_proof1(aux: &AuxPow, chain_id: u32) -> StepResult {
 /// * the 4-byte nonce must pin `chain_index` via the LCG.
 fn verify_proof2(aux_block_hash: &[u8; 32], aux: &AuxPow, chain_id: u32) -> Proof2Outcome {
     let depth = aux.chain_merkle_branch.len();
+    // Guard against a merkle-branch depth that would overflow `1u32 << depth`
+    // below (used for the anti-grind `2^depth` size check and the LCG slot).
+    // Mirrors `common::verify_auxpow_commitment`'s `height > 30` bound; a real
+    // AuxPoW commitment never exceeds it, so rejecting larger depths is strictly
+    // stricter than consensus and only drops malformed/fabricated witnesses.
+    if depth > 30 {
+        return Proof2Outcome {
+            proof2: StepResult::err(format!("merkle branch depth {depth} exceeds maximum (30)")),
+            anti_grind: StepResult::err("skipped: merkle branch depth exceeds maximum (30)"),
+            committed: None,
+            n_size: 0,
+            nonce: 0,
+        };
+    }
     let chain_root =
         common::merkle_fold_branch(aux_block_hash, &aux.chain_merkle_branch, aux.chain_index);
     let mut root_reversed = chain_root;
@@ -350,7 +375,7 @@ fn verify_proof2(aux_block_hash: &[u8; 32], aux: &AuxPow, chain_id: u32) -> Proo
 
     let grill = if n_size != (1u32 << depth) {
         StepResult::err(format!("anti-grind size {n_size} != 2^{depth}"))
-    } else if aux.chain_index != expected_index(nonce, chain_id, depth as u32) {
+    } else if aux.chain_index != common::get_expected_index(nonce, chain_id, depth as u32) {
         StepResult::err(format!(
             "chain index {} violates LCG slot (nonce {nonce}, chain_id {chain_id}, depth {depth})",
             aux.chain_index
@@ -368,15 +393,8 @@ fn verify_proof2(aux_block_hash: &[u8; 32], aux: &AuxPow, chain_id: u32) -> Proo
     }
 }
 
-/// Verbatim port of the LCG slot derivation (`CAuxPow::getExpectedIndex`); the
-/// canonical implementation lives in [`common::verify_auxpow_commitment`].
-fn expected_index(nonce: u32, chain_id: u32, height: u32) -> u32 {
-    let mut rand = nonce;
-    rand = rand.wrapping_mul(1103515245).wrapping_add(12345);
-    rand = rand.wrapping_add(chain_id);
-    rand = rand.wrapping_mul(1103515245).wrapping_add(12345);
-    rand % (1u32 << height)
-}
+/// The LCG slot derivation (`CAuxPow::getExpectedIndex`) is reused from
+/// [`common::get_expected_index`] to avoid diverging from the canonical verifier.
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)

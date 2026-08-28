@@ -43,6 +43,8 @@ pub enum AuxPowParseError {
     MissingParentHeader,
     /// No AuxPoW data was present after the 80-byte header (a non-merge-mined block).
     NoAuxPow,
+    /// A merkle-branch length field encoded an absurd count (allocation-DoS guard).
+    BadBranch(String),
 }
 
 impl core::fmt::Display for AuxPowParseError {
@@ -57,6 +59,7 @@ impl core::fmt::Display for AuxPowParseError {
                 write!(f, "auxpow wire ends before the 80-byte parent header")
             }
             Self::NoAuxPow => write!(f, "no CAuxPow witness after the 80-byte header"),
+            Self::BadBranch(m) => write!(f, "bad auxpow merkle branch: {m}"),
         }
     }
 }
@@ -150,7 +153,17 @@ impl<'a> Cursor<'a> {
 
     fn branch(&mut self) -> AuxPowParseResult<Vec<[u8; 32]>> {
         let n = self.varint()? as usize;
-        let mut out = Vec::with_capacity(n);
+        // A real AuxPoW merkle branch is at most ~32 entries (2^32 leaves). Bound the
+        // allocation so a malicious wire (varint up to 0xffffffff → multi-GB
+        // `Vec::with_capacity`) cannot crash the indexer via OOM. The loop below is
+        // independently bounded by the available bytes (hash32 errors past the end).
+        if n > 1 << 20 {
+            return Err(AuxPowParseError::BadBranch(format!(
+                "branch length {n} exceeds maximum ({}), likely malformed",
+                1 << 20
+            )));
+        }
+        let mut out = Vec::with_capacity(n.min(1 << 16));
         for _ in 0..n {
             out.push(self.hash32()?);
         }

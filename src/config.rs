@@ -91,6 +91,12 @@ pub struct Config {
     pub bind_addr: String,
     /// Libp2p parameters.
     pub p2p: crate::p2p::P2pConfig,
+    /// Optional bearer token required on `/verify` and mutating endpoints.
+    /// `None`/empty = no authentication (assumes a trusted LAN / local deploy).
+    pub auth_token: Option<String>,
+    /// Max requests per minute per client (best-effort, keyed on the
+    /// `x-forwarded-for` header). `None`/0 = unlimited.
+    pub rate_limit_per_min: Option<u32>,
 }
 
 /// TOML file shape — mirrors the env schema 1:1, all fields optional.
@@ -108,6 +114,8 @@ struct ConfigFile {
     http: HttpFile,
     cors_origins: Option<String>,
     bind_addr: Option<String>,
+    auth_token: Option<String>,
+    rate_limit_per_min: Option<u32>,
     p2p: P2pFile,
 }
 
@@ -231,6 +239,18 @@ impl Config {
             .or_else(|| file.as_ref().and_then(|f| f.resolver.fallback_base.clone()))
             .filter(|b| !b.is_empty());
 
+        // M9 — the parent-chain explorer is an advisory discovery signal only, never
+        // a trust anchor for epoch boundaries (clients verify independently / on-chain).
+        // A tampered or unavailable explorer can only degrade discovery UX, not safety,
+        // but operators should prefer their own node and treat this classification as
+        // best-effort. Surface that loudly so it is never mistaken for authoritative.
+        if !resolver_base.is_empty() {
+            tracing::warn!(
+                resolver = %resolver_base,
+                "Parent classification uses an external explorer (advisory only, NOT a trust anchor). Prefer a self-hosted node; misclassification only affects epoch-discovery UX, never on-chain verification."
+            );
+        }
+
         let max_batch = env_num("PSOB_MAX_BATCH")?
             .or_else(|| file.as_ref().and_then(|f| f.max_batch))
             .unwrap_or(64);
@@ -280,6 +300,13 @@ impl Config {
                 format!("0.0.0.0:{port}")
             });
 
+        let auth_token = env_var("PSOB_AUTH_TOKEN")?
+            .or_else(|| file.as_ref().and_then(|f| f.auth_token.clone()))
+            .filter(|s| !s.is_empty());
+        let rate_limit_per_min = env_num("PSOB_RATE_LIMIT_PER_MIN")?
+            .or_else(|| file.as_ref().and_then(|f| f.rate_limit_per_min))
+            .filter(|v| *v > 0);
+
         let p2p = crate::p2p::P2pConfig::from_parts(
             env_num("PSOB_P2P_PORT")?.or_else(|| file.as_ref().and_then(|f| f.p2p.port)),
             env_var("PSOB_P2P_BIND")?.or_else(|| file.as_ref().and_then(|f| f.p2p.bind.clone())),
@@ -317,6 +344,8 @@ impl Config {
             cors_origins: cors,
             bind_addr,
             p2p,
+            auth_token,
+            rate_limit_per_min,
         })
     }
 }

@@ -58,6 +58,8 @@ fn config() -> Config {
         cors_origins: vec!["*".into()],
         bind_addr: "127.0.0.1:0".into(),
         p2p: P2pConfig::default(),
+        auth_token: None,
+        rate_limit_per_min: None,
     }
 }
 

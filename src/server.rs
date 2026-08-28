@@ -16,12 +16,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::{catch_panic::CatchPanicLayer, cors::CorsLayer, trace::TraceLayer};
@@ -351,6 +352,10 @@ pub struct EpochResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VerifyResponse {
     pub valid: bool,
+    /// H2 — explicit honesty flag: the indexer does NOT verify scrypt PoW (that is
+    /// the ZK guest's job). `valid:true` only means the structural / AuxPoW
+    /// commitment checks passed. Never treat `valid` as proof-of-work authority.
+    pub pow_checked: bool,
     pub chain_id: u32,
     pub block_hash: String,
     pub parent_hash: String,
@@ -362,6 +367,11 @@ pub struct VerifyResponse {
     pub chain_index: u32,
     pub verification: crate::verify::VerificationReport,
 }
+
+/// M8 — upper bound on `wire_hex` size for `/verify`. A real AuxPoW wire blob
+/// (80-byte header ‖ CAuxPow) is a few hundred bytes to a few KB; anything larger
+/// is either malformed or a memory-exhaustion attempt.
+const MAX_WIRE_HEX_LEN: usize = 1_000_000;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StatsChain {
@@ -431,8 +441,10 @@ pub struct VerifyRequest {
     pub chain_id: u32,
     /// Full wire payload: 80-byte header ‖ CAuxPow, hex.
     pub wire_hex: String,
-    /// Pow limit bytes (headered chain's consensus floor). Optional when the
-    /// chain is configured on the indexer.
+    /// H2 — retained only for client compatibility. The indexer NEVER trusts a
+    /// caller-supplied pow limit: a caller could otherwise present a diff-1 limit
+    /// and have `valid:true` bless a forgeable header. The configured chain's
+    /// consensus `pow_limit_bits` is always used instead. Ignored if present.
     pub pow_limit_bits: Option<u32>,
 }
 
@@ -698,8 +710,101 @@ async fn cosettle_handler(
     }))
 }
 
+/// M8 — shared state for the auth/rate-limit middleware.
+#[derive(Clone)]
+struct SecurityState {
+    config: Config,
+    buckets: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>>,
+}
+
+/// M8 — best-effort security middleware: optional bearer-token auth and optional
+/// per-client rate limiting. Both controls are off by default (unset config), so
+/// the indexer behaves as before on trusted LAN/local deployments.
+async fn security_middleware(
+    State(sec): State<SecurityState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // 1) Optional bearer-token authentication (constant-time comparison).
+    if let Some(expected) = &sec.config.auth_token {
+        let ok = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| constant_time_eq(v.as_bytes(), format!("Bearer {expected}").as_bytes()))
+            .unwrap_or(false);
+        if !ok {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    "Bearer",
+                )],
+                "missing or invalid Authorization bearer token",
+            )
+                .into_response();
+        }
+    }
+
+    // 2) Optional per-client rate limiting. Key on the real TCP peer when the
+    //    server was started with connect-info (production); otherwise fall back to
+    //    the first `x-forwarded-for` hop (trusted-proxy deployments); if neither is
+    //    available we cannot attribute, so we skip rather than lock out traffic.
+    if let Some(limit) = sec.config.rate_limit_per_min {
+        let client_ip: Option<std::net::IpAddr> = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.ip())
+            .or_else(|| {
+                req.headers()
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.split(',').next())
+                    .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+            });
+        if let Some(ip) = client_ip {
+            let mut buckets = sec.buckets.lock().await;
+            // Bound map growth: drop it if a spoofed-header flood inflated it.
+            if buckets.len() > 65_536 {
+                buckets.clear();
+            }
+            let now = std::time::Instant::now();
+            let entry = buckets.entry(ip).or_insert((0, now));
+            if now.duration_since(entry.1).as_secs() >= 60 {
+                *entry = (0, now);
+            }
+            if entry.0 >= limit {
+                return (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "rate limit exceeded (per minute)",
+                )
+                    .into_response();
+            }
+            entry.0 += 1;
+        }
+    }
+
+    next.run(req).await
+}
+
+/// Constant-time byte comparison (avoid leaking token length via timing).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub fn create_router(state: AppState) -> Router {
     let cors = if state.config.cors_origins.iter().any(|o| o == "*") {
+        tracing::warn!(
+            cors_origins = "*",
+            "CORS is permissive ('*'). Set PSOB_CORS_ORIGINS to explicit origins in production."
+        );
         CorsLayer::permissive()
     } else {
         // A single malformed origin must NOT panic the whole server at boot.
@@ -749,6 +854,18 @@ pub fn create_router(state: AppState) -> Router {
             }
         },
     );
+    // M8 — optional auth + best-effort per-client rate limiting. Both are
+    // opt-in (default off) so existing LAN/local deployments and the test suite
+    // are unaffected; production operators set `PSOB_AUTH_TOKEN` and/or
+    // `PSOB_RATE_LIMIT_PER_MIN`.
+    let sec = SecurityState {
+        config: state.config.clone(),
+        buckets: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+            std::net::IpAddr,
+            (u32, std::time::Instant),
+        >::new())),
+    };
+
     let api: Router<()> = Router::new()
         .route("/health", get(health_handler))
         .route("/api/v1/health", get(health_handler))
@@ -769,13 +886,18 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/swap/intents", get(list_swap_intents))
         .route("/api/v1/swap/intents", post(create_swap_intent))
         .route("/api/v1/cosettle", get(cosettle_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            sec,
+            security_middleware,
+        ));
     let docs: Router<()> = utoipa_swagger_ui::SwaggerUi::new("/docs")
         .url("/api/v1/openapi.json", openapi_doc())
         .into();
     Router::new()
         .merge(docs)
         .merge(api)
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(cors)
         .layer(CatchPanicLayer::new())
         .layer(metrics_middleware)
@@ -949,7 +1071,15 @@ async fn blocks_handler(
         .ok_or_else(|| ApiError::BadRequest("chain_id query parameter is required".into()))?;
     let page = Page::new(q.limit, q.offset);
     let (from, to) = match (q.from, q.to) {
-        (Some(f), Some(t)) => (f, t),
+        (Some(f), Some(t)) => {
+            if f > t {
+                return Err(ApiError::BadRequest("from must be <= to".into()));
+            }
+            if t.saturating_sub(f) > 10_000 {
+                return Err(ApiError::BadRequest("requested block range exceeds maximum of 10000".into()));
+            }
+            (f, t)
+        }
         (Some(f), None) => (f, u64::MAX),
         (None, Some(t)) => (0, t),
         (None, None) => (0, u64::MAX),
@@ -1038,6 +1168,9 @@ async fn epoch_handler(
     if ltc_start > ltc_end {
         return Err(ApiError::BadRequest("ltc_start must be <= ltc_end".into()));
     }
+    if ltc_end.saturating_sub(ltc_start) > 10_000 {
+        return Err(ApiError::BadRequest("requested epoch range exceeds maximum of 10000".into()));
+    }
     let page = Page::new(q.limit, q.offset);
     let (blocks, total) = state
         .db
@@ -1110,20 +1243,33 @@ async fn verify_handler(
     State(state): State<AppState>,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, ApiError> {
+    // M8 — bound the input size before any parsing / allocation.
+    if req.wire_hex.len() > MAX_WIRE_HEX_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "wire_hex too large: {} bytes (max {})",
+            req.wire_hex.len(),
+            MAX_WIRE_HEX_LEN
+        )));
+    }
     let wire = hex::decode(&req.wire_hex)
         .map_err(|e| ApiError::BadRequest(format!("wire_hex is not valid hex: {e}")))?;
-    let pow_limit = match req.pow_limit_bits {
-        Some(pl) => pl,
-        None => pow_limit_for(&state.config, req.chain_id).ok_or_else(|| {
-            ApiError::BadRequest("chain not configured: supply pow_limit_bits".into())
-        })?,
-    };
+
+    // H2 — never trust a caller-supplied pow limit. Use the indexer's configured
+    // consensus floor for the chain; reject if the chain is not configured here
+    // (the indexer is per-operator and only vouches for chains it knows).
+    let pow_limit = pow_limit_for(&state.config, req.chain_id).ok_or_else(|| {
+        ApiError::BadRequest(
+            "chain not configured on this indexer; cannot vouch for its pow limit".into(),
+        )
+    })?;
 
     let (aux_block, report) = crate::verify::verify_wire_block(&wire, req.chain_id, pow_limit)
         .map_err(|e| ApiError::BadRequest(format!("cannot parse CAuxPow wire: {e}")))?;
 
     Ok(Json(VerifyResponse {
         valid: report.valid,
+        // H2 — the indexer performs NO scrypt PoW verification; the ZK guest does.
+        pow_checked: false,
         chain_id: req.chain_id,
         block_hash: aux_block.block_hash_display(),
         parent_hash: aux_block.parent_hash_display(),
