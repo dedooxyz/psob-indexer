@@ -69,6 +69,16 @@ NAME|CHAIN_ID|ELECTRS_URL|POWLIMIT_BITS_HEX[|START_HEIGHT]
 | `POWLIMIT_BITS_HEX` | consensus powLimit in compact nBits (`0x1e0fffff` = scrypt family) |
 | `START_HEIGHT` | cursor seed for fresh DBs — the walk ingests `START_HEIGHT+1..tip` |
 
+```
+NAME|CHAIN_ID|ELECTRS_URL
+```
+
+is the shape of `PSOB_KNOWN_CHAINS` (or `[[known_chains]]` in the TOML):
+registry-only chains — registered at startup, listed by `GET /api/v1/chains`
+with `"ingested": false`, accepted as swap legs, but **never ingested**. That
+is where Litecoin lives (the parent chain: settlement anchor for swaps, but its
+80-byte headers carry no AuxPoW witness to ingest).
+
 ### Run in Docker
 
 ```bash

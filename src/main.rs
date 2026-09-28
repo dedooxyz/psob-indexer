@@ -38,6 +38,18 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Arc::new(Database::open(&config.db_path)?);
 
+    // Registry-only chains (e.g. Litecoin, the parent): registered so the swap
+    // validator and /api/v1/chains know them, but never polled by the ingestor.
+    for k in &config.known_chains {
+        db.upsert_chain(k.chain_id, &k.name, &k.electrs)?;
+    }
+    if !config.known_chains.is_empty() {
+        tracing::info!(
+            count = config.known_chains.len(),
+            "registered known (non-ingested) chains"
+        );
+    }
+
     // P2P is optional: if the swarm fails to start, the node still serves REST.
     let (p2p_handle, p2p_task) = match start_p2p_swarm(config.p2p.clone(), db.clone()).await {
         Ok((h, task)) => {

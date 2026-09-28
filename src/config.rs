@@ -70,6 +70,8 @@ pub struct HttpConfig {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub chains: Vec<AuxChain>,
+    /// Chains registered in the registry but not ingested (`PSOB_KNOWN_CHAINS`).
+    pub known_chains: Vec<KnownChain>,
     /// Redb database path.
     pub db_path: String,
     pub resolver: ResolverConfig,
@@ -99,11 +101,23 @@ pub struct Config {
     pub rate_limit_per_min: Option<u32>,
 }
 
+/// A chain that belongs to the registry but is never ingested — e.g. Litecoin,
+/// the parent chain, whose 80-byte headers carry no AuxPoW witness for
+/// [`crate::verify::light_verify`]. Registered chains are accepted as swap
+/// legs and listed by `/api/v1/chains`, but no ingest task polls them.
+#[derive(Clone, Debug)]
+pub struct KnownChain {
+    pub chain_id: u32,
+    pub name: String,
+    pub electrs: String,
+}
+
 /// TOML file shape — mirrors the env schema 1:1, all fields optional.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ConfigFile {
     chains: Vec<ChainEntry>,
+    known_chains: Vec<KnownChainEntry>,
     db_path: Option<String>,
     resolver: ResolverFile,
     max_batch: Option<u64>,
@@ -128,6 +142,14 @@ struct ChainEntry {
     /// Pow limit as hex (with or without `0x` prefix).
     pow_limit_bits: String,
     start_height: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct KnownChainEntry {
+    name: String,
+    chain_id: u32,
+    electrs_url: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -219,6 +241,17 @@ impl Config {
             anyhow::bail!("PSOB_CHAINS is empty — nothing to ingest");
         }
 
+        // Registry-only chains: configured so the swap validator and
+        // /api/v1/chains know them, but no ingest task ever polls them.
+        let known_chains = match env_var("PSOB_KNOWN_CHAINS")? {
+            Some(raw) => parse_known_chain_specs(&raw)?,
+            None => file
+                .as_ref()
+                .map(|f| parse_file_known_chains(&f.known_chains))
+                .unwrap_or_default(),
+        };
+        check_known_chain_ids(&chains, &known_chains)?;
+
         let db_path = env_var("PSOB_DB_PATH")?
             .or_else(|| file.as_ref().and_then(|f| f.db_path.clone()))
             .unwrap_or_else(|| "psob-indexer.redb".to_string());
@@ -235,9 +268,10 @@ impl Config {
             .or_else(|| file.as_ref().and_then(|f| f.resolver.parent_chain.clone()))
             .unwrap_or_else(|| "litecoin".to_string());
         let parent_chain = normalize_parent_chain(parent_chain)?;
-        let fallback_base = env_first(&["PSOB_PARENT_ELECTRS_FALLBACK", "PSOB_CCNODES_FALLBACK_BASE"])?
-            .or_else(|| file.as_ref().and_then(|f| f.resolver.fallback_base.clone()))
-            .filter(|b| !b.is_empty());
+        let fallback_base =
+            env_first(&["PSOB_PARENT_ELECTRS_FALLBACK", "PSOB_CCNODES_FALLBACK_BASE"])?
+                .or_else(|| file.as_ref().and_then(|f| f.resolver.fallback_base.clone()))
+                .filter(|b| !b.is_empty());
 
         // M9 — the parent-chain explorer is an advisory discovery signal only, never
         // a trust anchor for epoch boundaries (clients verify independently / on-chain).
@@ -320,6 +354,7 @@ impl Config {
 
         Ok(Self {
             chains,
+            known_chains,
             db_path,
             resolver: ResolverConfig {
                 base: resolver_base,
@@ -406,6 +441,62 @@ fn check_unique_chain_ids(chains: &[AuxChain]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A registry chain and an ingested chain sharing a `chain_id` would shadow
+/// each other (same id, two sources of truth). Reject that at parse time.
+fn check_known_chain_ids(chains: &[AuxChain], known: &[KnownChain]) -> anyhow::Result<()> {
+    let mut seen: std::collections::HashSet<u32> = chains.iter().map(|c| c.chain_id).collect();
+    for k in known {
+        if !seen.insert(k.chain_id) {
+            anyhow::bail!(
+                "duplicate chain_id {id} in PSOB_KNOWN_CHAINS — already configured in PSOB_CHAINS",
+                id = k.chain_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parse `PSOB_KNOWN_CHAINS=NAME|CHAIN_ID|ELECTRS_URL[,NAME|CHAIN_ID|ELECTRS_URL]`.
+/// These chains are registered but never ingested.
+fn parse_known_chain_specs(raw: &str) -> anyhow::Result<Vec<KnownChain>> {
+    let mut chains = Vec::new();
+    for spec in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let mut parts = spec.splitn(3, '|');
+        let name = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("PSOB_KNOWN_CHAINS entry {spec:?} missing NAME"))?;
+        let chain_id: u32 = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("PSOB_KNOWN_CHAINS entry {spec:?} missing CHAIN_ID"))?
+            .parse()
+            .map_err(|_| anyhow::anyhow!("PSOB_KNOWN_CHAINS {spec:?}: bad CHAIN_ID"))?;
+        let electrs = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("PSOB_KNOWN_CHAINS entry {spec:?} missing ELECTRS_URL"))?
+            .trim_end_matches('/')
+            .to_string();
+        chains.push(KnownChain {
+            chain_id,
+            name: normalize_chain_name(name, chain_id),
+            electrs,
+        });
+    }
+    Ok(chains)
+}
+
+fn parse_file_known_chains(entries: &[KnownChainEntry]) -> Vec<KnownChain> {
+    entries
+        .iter()
+        .map(|e| KnownChain {
+            chain_id: e.chain_id,
+            name: normalize_chain_name(&e.name, e.chain_id),
+            electrs: e.electrs_url.trim_end_matches('/').to_string(),
+        })
+        .collect()
 }
 
 fn parse_file_chains(entries: &[ChainEntry]) -> anyhow::Result<Vec<AuxChain>> {
@@ -502,6 +593,30 @@ mod tests {
         assert!(parse_chain_specs("JKC|not_a_number|url|0x1e0fffff").is_err());
         assert!(parse_chain_specs("JKC|8224||0x1e0fffff").is_err());
         assert!(parse_chain_specs("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_known_chains_and_rejects_shadowed_ids() {
+        let known = parse_known_chain_specs("LTC|8192|https://ltc-api.s3na.xyz/").expect("parses");
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].chain_id, 8192);
+        assert_eq!(known[0].name, "LTC");
+        assert_eq!(
+            known[0].electrs, "https://ltc-api.s3na.xyz",
+            "trailing slash trimmed"
+        );
+        assert!(parse_known_chain_specs("LTC|nope|https://ltc-api.s3na.xyz").is_err());
+        assert!(parse_known_chain_specs("LTC|8192").is_err());
+        assert!(parse_known_chain_specs("").unwrap().is_empty());
+
+        let chains =
+            parse_chain_specs("JKC|8224|https://junk-api.s3na.xyz|0x1e0fffff").expect("parses");
+        check_known_chain_ids(&chains, &known).expect("distinct ids are fine");
+        let shadow = parse_known_chain_specs("JKC|8224|https://junk-api.s3na.xyz").expect("parses");
+        let err = check_known_chain_ids(&chains, &shadow)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate chain_id 8224"), "{err}");
     }
 
     #[test]

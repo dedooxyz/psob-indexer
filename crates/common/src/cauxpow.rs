@@ -118,37 +118,68 @@ impl<'a> Cursor<'a> {
         })
     }
 
-    /// Walk the legacy (no-witness) transaction structure [start..p); returns the
-    /// start..end byte range of the whole tx, leaving the cursor after locktime.
-    fn take_tx(&mut self) -> AuxPowParseResult<(usize, usize)> {
-        let start = self.p;
-        self.take(4)?; // version
-        let nin = self.varint()?;
+    /// Walk a transaction and return its **legacy (no-witness) serialization**
+    /// plus the offset just past `locktime`.
+    ///
+    /// SegWit serialization (marker `0x00`, flag `0x01`, per-input witness after
+    /// the outputs) is accepted — merged-mining parent coinbases carry a witness
+    /// commitment output and a reserved value — and the witness is **stripped**,
+    /// because `txid` commits to the no-witness serialization: that is exactly
+    /// what the parent block's merkle root folds from.
+    fn take_tx(&mut self) -> AuxPowParseResult<(Vec<u8>, usize)> {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(self.take(4)?); // version
+        let mut nin = self.varint()?;
+        let mut segwit = false;
         if nin == 0 {
-            return Err(AuxPowParseError::BadCoinbase(
-                "zero inputs (segwit marker?)".into(),
-            ));
-        }
-        for _ in 0..nin {
-            self.take(36)?; // prevout
-            let sl = self.varint()? as usize;
-            if self.take(sl).is_err() {
-                return Err(AuxPowParseError::BadCoinbase("scriptSig overruns".into()));
-            }
-            self.take(4)?; // sequence
-        }
-        let nout = self.varint()?;
-        for _ in 0..nout {
-            self.take(8)?; // value
-            let sl = self.varint()? as usize;
-            if self.take(sl).is_err() {
+            // `0x00` is never a valid input count for a coinbase; only the SegWit
+            // marker+flag pair (0x00, 0x01) may follow it.
+            if self.take(1)? != [0x01] {
                 return Err(AuxPowParseError::BadCoinbase(
-                    "scriptPubKey overruns".into(),
+                    "zero inputs (segwit marker without flag 0x01)".into(),
                 ));
             }
+            segwit = true;
+            nin = self.varint()?;
+            if nin == 0 {
+                return Err(AuxPowParseError::BadCoinbase("zero inputs".into()));
+            }
         }
-        self.take(4)?; // locktime
-        Ok((start, self.p))
+        write_varint(&mut legacy, nin);
+        for _ in 0..nin {
+            legacy.extend_from_slice(self.take(36)?); // prevout
+            let sl = self.varint()? as usize;
+            write_varint(&mut legacy, sl as u64);
+            let script = self
+                .take(sl)
+                .map_err(|_| AuxPowParseError::BadCoinbase("scriptSig overruns".into()))?;
+            legacy.extend_from_slice(script);
+            legacy.extend_from_slice(self.take(4)?); // sequence
+        }
+        let nout = self.varint()?;
+        write_varint(&mut legacy, nout);
+        for _ in 0..nout {
+            legacy.extend_from_slice(self.take(8)?); // value
+            let sl = self.varint()? as usize;
+            write_varint(&mut legacy, sl as u64);
+            let spk = self
+                .take(sl)
+                .map_err(|_| AuxPowParseError::BadCoinbase("scriptPubKey overruns".into()))?;
+            legacy.extend_from_slice(spk);
+        }
+        if segwit {
+            // Witness: `nitems` (varint) ‖ items (varint length ‖ bytes), one
+            // group per input — consumed but dropped from `legacy`.
+            for _ in 0..nin {
+                let nitems = self.varint()?;
+                for _ in 0..nitems {
+                    let sl = self.varint()? as usize;
+                    self.take(sl)?;
+                }
+            }
+        }
+        legacy.extend_from_slice(self.take(4)?); // locktime
+        Ok((legacy, self.p))
     }
 
     fn branch(&mut self) -> AuxPowParseResult<Vec<[u8; 32]>> {
@@ -171,6 +202,23 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Encode `n` as a canonical Bitcoin varint (used to rebuild the legacy
+/// transaction serialization from its parsed parts).
+fn write_varint(out: &mut Vec<u8>, n: u64) {
+    if n < 0xfd {
+        out.push(n as u8);
+    } else if n <= u16::MAX as u64 {
+        out.push(0xfd);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= u32::MAX as u64 {
+        out.push(0xfe);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        out.push(0xff);
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
 /// Split a full `/block/:hash/header` payload into the 80-byte base header and
 /// the parsed [`AuxPow`] witness.
 pub fn parse_auxpow(full: &[u8]) -> AuxPowParseResult<([u8; HEADER_LEN], AuxPow)> {
@@ -188,8 +236,10 @@ pub fn parse_auxpow(full: &[u8]) -> AuxPowParseResult<([u8; HEADER_LEN], AuxPow)
     cur.p = HEADER_LEN;
 
     // CAuxPow = CMerkleTx(coinbase) ‖ chainMerkleBranch ‖ chainIndex ‖ parentHeader.
-    let (cb_start, cb_end) = cur.take_tx()?;
-    let coinbase_tx = full[cb_start..cb_end].to_vec();
+    // `take_tx` yields the witness-stripped coinbase and leaves the cursor just
+    // past its locktime (it consumes the witness when present).
+    let (coinbase_tx, cb_end) = cur.take_tx()?;
+    debug_assert_eq!(cb_end, cur.p, "take_tx must stop right past locktime");
     let _hash_block = cur.hash32()?; // CMerkleTx.hashBlock — not used by verification
     let parent_merkle_branch = cur.branch()?;
     let parent_index = cur.u32_le()?;
@@ -284,13 +334,50 @@ mod tests {
     #[test]
     fn rejects_bad_coinbase() {
         let mut raw = vec![0u8; HEADER_LEN];
-        // A zero version with a zero-input coinbase marker (segwit style) must not parse.
+        // A zero input count must only be tolerated as a SegWit marker, and only
+        // with flag 0x01 — eight zero bytes give neither.
         raw.extend_from_slice(&[0u8; 8]);
         assert_eq!(
             parse_auxpow(&raw).err(),
             Some(AuxPowParseError::BadCoinbase(
-                "zero inputs (segwit marker?)".into()
+                "zero inputs (segwit marker without flag 0x01)".into()
             ))
         );
+    }
+
+    /// A real merged-mining block whose parent coinbase is SegWit-serialized
+    /// (marker `0x00 0x01`, witness commitment output, reserved-value witness).
+    /// Historically this failed with `zero inputs (segwit marker?)` and halted
+    /// JKC ingest at that height forever.
+    #[test]
+    fn parses_segwit_serialized_parent_coinbase() {
+        let raw = hex::decode(include_str!("../tests/fixtures/jkc_1098227_header.hex").trim())
+            .expect("fixture hex");
+        let (base, aux) = parse_auxpow(&raw).expect("segwit coinbase must parse");
+
+        // The witness must be stripped: the txid we hand to the merkle fold has
+        // to reproduce the parent header's merkle root.
+        let cb_txid = crate::sha256d(&aux.coinbase_tx);
+        let folded =
+            crate::merkle_fold_branch(&cb_txid, &aux.parent_merkle_branch, aux.parent_index);
+        assert_eq!(
+            folded,
+            aux.parent_merkle_root().expect("parent header is 80 bytes"),
+            "coinbase txid must be witness-stripped to fold into the parent root"
+        );
+
+        // Rebuilt legacy serialization: version ‖ input-count ‖ … with no marker.
+        assert_eq!(&aux.coinbase_tx[4..5], &[1], "one input, no segwit marker");
+        // The merged-mining commitment lives in the scriptSig, untouched.
+        assert!(
+            aux.coinbase_tx.windows(4).any(|w| w == crate::AUXPOW_MAGIC),
+            "AuxPoW magic still present after stripping"
+        );
+        // Full gate: proof1 (parent fold) + proof2 (chain root) + anti-grind.
+        assert!(crate::verify_auxpow_commitment(
+            &crate::sha256d(&base),
+            &aux,
+            8224
+        ));
     }
 }

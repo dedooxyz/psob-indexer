@@ -22,9 +22,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::net::SocketAddr;
 use tower_http::{catch_panic::CatchPanicLayer, cors::CorsLayer, trace::TraceLayer};
 
 use crate::metrics::Metrics;
@@ -196,6 +196,9 @@ pub struct ChainStatus {
     pub blocks: u64,
     pub min_height: Option<u64>,
     pub max_height: Option<u64>,
+    /// `false` for registry-only chains (`PSOB_KNOWN_CHAINS`): known to swap
+    /// validation, but never ingested, so no `pow_limit` is enforced.
+    pub ingested: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -580,7 +583,9 @@ async fn create_swap_intent(
     if let Some(handle) = &state.p2p {
         handle.broadcast_intent(intent.clone()).await;
     }
-    Ok(Json(json!({"status": "accepted", "intent_id": intent.intent_id})))
+    Ok(Json(
+        json!({"status": "accepted", "intent_id": intent.intent_id}),
+    ))
 }
 
 #[utoipa::path(
@@ -656,29 +661,33 @@ async fn cosettle_handler(
 ) -> Result<Json<CoSettleResponse>, ApiError> {
     let a_height = match q.a_height {
         Some(h) => h,
-        None => state
-            .db
-            .latest_height(q.a_chain)?
-            .ok_or_else(|| ApiError::NotFound(format!("no blocks indexed for chain {}", q.a_chain)))?,
+        None => state.db.latest_height(q.a_chain)?.ok_or_else(|| {
+            ApiError::NotFound(format!("no blocks indexed for chain {}", q.a_chain))
+        })?,
     };
     let b_height = match q.b_height {
         Some(h) => h,
-        None => state
-            .db
-            .latest_height(q.b_chain)?
-            .ok_or_else(|| ApiError::NotFound(format!("no blocks indexed for chain {}", q.b_chain)))?,
+        None => state.db.latest_height(q.b_chain)?.ok_or_else(|| {
+            ApiError::NotFound(format!("no blocks indexed for chain {}", q.b_chain))
+        })?,
     };
-    let ba = state
-        .db
-        .block_at(q.a_chain, a_height)?
-        .ok_or_else(|| ApiError::NotFound(format!("block {}@{} is not indexed", q.a_chain, a_height)))?;
-    let bb = state
-        .db
-        .block_at(q.b_chain, b_height)?
-        .ok_or_else(|| ApiError::NotFound(format!("block {}@{} is not indexed", q.b_chain, b_height)))?;
+    let ba = state.db.block_at(q.a_chain, a_height)?.ok_or_else(|| {
+        ApiError::NotFound(format!("block {}@{} is not indexed", q.a_chain, a_height))
+    })?;
+    let bb = state.db.block_at(q.b_chain, b_height)?.ok_or_else(|| {
+        ApiError::NotFound(format!("block {}@{} is not indexed", q.b_chain, b_height))
+    })?;
 
-    let pa = ba.header.aux.as_ref().map(|a| crate::db::sha256d(&a.parent_header));
-    let pb = bb.header.aux.as_ref().map(|a| crate::db::sha256d(&a.parent_header));
+    let pa = ba
+        .header
+        .aux
+        .as_ref()
+        .map(|a| crate::db::sha256d(&a.parent_header));
+    let pb = bb
+        .header
+        .aux
+        .as_ref()
+        .map(|a| crate::db::sha256d(&a.parent_header));
     let co_settled = matches!((&pa, &pb), (Some(x), Some(y)) if x == y);
 
     let (shared_ltc_parent, ltc_height, epoch) = if co_settled {
@@ -688,7 +697,12 @@ async fn cosettle_handler(
         let token = crate::db::sha256d(
             format!(
                 "{}/{}/{}/{}/{}/{}",
-                q.a_chain, a_height, q.b_chain, b_height, display_hex(&p), display_hex(&p)
+                q.a_chain,
+                a_height,
+                q.b_chain,
+                b_height,
+                display_hex(&p),
+                display_hex(&p)
             )
             .as_bytes(),
         );
@@ -714,7 +728,9 @@ async fn cosettle_handler(
 #[derive(Clone)]
 struct SecurityState {
     config: Config,
-    buckets: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>>,
+    buckets: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+    >,
 }
 
 /// M8 — best-effort security middleware: optional bearer-token auth and optional
@@ -736,10 +752,7 @@ async fn security_middleware(
         if !ok {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                [(
-                    axum::http::header::WWW_AUTHENTICATE,
-                    "Bearer",
-                )],
+                [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
                 "missing or invalid Authorization bearer token",
             )
                 .into_response();
@@ -930,25 +943,51 @@ async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
     responses((status = 200, description = "Configured aux chains and sync cursors", body = ChainsResponse))
 )]
 async fn chains_handler(State(state): State<AppState>) -> Result<Json<ChainsResponse>, ApiError> {
-    let mut chains = Vec::new();
-    for c in &state.config.chains {
-        let cursor = state.db.cursor_height(c.chain_id)?;
+    let status = |chain_id: u32,
+                  name: &str,
+                  electrs: &str,
+                  pow_limit: String,
+                  ingested: bool|
+     -> anyhow::Result<ChainStatus> {
+        let cursor = state.db.cursor_height(chain_id)?;
         let stats = state
             .db
             .stats()?
             .chains
             .into_iter()
-            .find(|s| s.chain_id == c.chain_id);
-        chains.push(ChainStatus {
-            chain_id: c.chain_id,
-            name: c.name.clone(),
-            electrs_url: c.electrs.clone(),
+            .find(|s| s.chain_id == chain_id);
+        Ok(ChainStatus {
+            chain_id,
+            name: name.to_string(),
+            electrs_url: electrs.to_string(),
             cursor_height: cursor,
-            pow_limit_bits: format!("{:#010x}", c.pow_limit_bits),
+            pow_limit_bits: pow_limit,
             blocks: stats.as_ref().map(|s| s.blocks).unwrap_or(0),
             min_height: stats.as_ref().and_then(|s| s.min_height),
             max_height: stats.as_ref().and_then(|s| s.max_height),
-        });
+            ingested,
+        })
+    };
+
+    let mut chains = Vec::new();
+    for c in &state.config.chains {
+        chains.push(status(
+            c.chain_id,
+            &c.name,
+            &c.electrs,
+            format!("{:#010x}", c.pow_limit_bits),
+            true,
+        )?);
+    }
+    // Registry-only chains: known to swap validation, never ingested.
+    for k in &state.config.known_chains {
+        chains.push(status(
+            k.chain_id,
+            &k.name,
+            &k.electrs,
+            "0x00000000".to_string(),
+            false,
+        )?);
     }
     Ok(Json(ChainsResponse {
         count: chains.len(),
@@ -973,9 +1012,10 @@ async fn siblings_handler(
     Query(q): Query<SiblingQuery>,
 ) -> Result<Json<Paged<SiblingSummary>>, ApiError> {
     let page = Page::new(q.limit, q.offset);
-    let (parents, total) = state
-        .db
-        .shared_mainnet_parents(q.min_legs.unwrap_or(2), page, q.chain_id)?;
+    let (parents, total) =
+        state
+            .db
+            .shared_mainnet_parents(q.min_legs.unwrap_or(2), page, q.chain_id)?;
     let items: Vec<SiblingSummary> = parents
         .into_iter()
         .map(|p| SiblingSummary {
@@ -1076,7 +1116,9 @@ async fn blocks_handler(
                 return Err(ApiError::BadRequest("from must be <= to".into()));
             }
             if t.saturating_sub(f) > 10_000 {
-                return Err(ApiError::BadRequest("requested block range exceeds maximum of 10000".into()));
+                return Err(ApiError::BadRequest(
+                    "requested block range exceeds maximum of 10000".into(),
+                ));
             }
             (f, t)
         }
@@ -1169,7 +1211,9 @@ async fn epoch_handler(
         return Err(ApiError::BadRequest("ltc_start must be <= ltc_end".into()));
     }
     if ltc_end.saturating_sub(ltc_start) > 10_000 {
-        return Err(ApiError::BadRequest("requested epoch range exceeds maximum of 10000".into()));
+        return Err(ApiError::BadRequest(
+            "requested epoch range exceeds maximum of 10000".into(),
+        ));
     }
     let page = Page::new(q.limit, q.offset);
     let (blocks, total) = state

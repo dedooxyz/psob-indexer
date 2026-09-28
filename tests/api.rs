@@ -34,6 +34,7 @@ fn config() -> Config {
                 start_height: Some(1_000_000),
             },
         ],
+        known_chains: Vec::new(),
         db_path: tmp_db_path("app").display().to_string(),
         resolver: ResolverConfig {
             base: "https://litecoinspace.org/api".into(),

@@ -5,9 +5,10 @@
 # e.g. PSOB_CHAINS beats [[chains]].
 
 # ─── Aux chains to ingest ──────────────────────────────────────────────────────
-# Adding a chain is a new [[chains]] block — no code changes. For Dogecoin
-# later: chain_id = DOGE nVersion >> 16 (look it up in dogecoin core), an
-# Esplora URL serving raw headers, pow_limit_bits 0x1e0fffff.
+# Adding a chain is a new [[chains]] block — no code changes. Dogecoin/Bellcoin
+# are AuxPoW-mined BY Litecoin and go here like any other aux chain:
+#   chain_id = nVersion >> 16 (look it up in that chain's core), an Esplora URL
+#   serving raw CAuxPow headers, pow_limit_bits 0x1e0fffff.
 [[chains]]
 name = "JKC"
 chain_id = 8224
@@ -20,6 +21,17 @@ name = "DINGO"
 chain_id = 50
 electrs_url = "https://dingo-api.s3na.xyz"
 pow_limit_bits = "0x1e0fffff"
+
+# ─── Registry-only chains (registered, NEVER ingested) ────────────────────────
+# Upserted into the chain registry at startup (swap validation + /api/v1/chains
+# with "ingested": false); no ingest task polls them. A chain_id may not appear
+# in both [[chains]] and [[known_chains]] — startup rejects that.
+# Litecoin is the PARENT chain (see [resolver]): its 80-byte headers carry no
+# AuxPoW witness, but swaps settle against it, so it must be known.
+[[known_chains]]
+name = "LTC"
+chain_id = 8192
+electrs_url = "https://ltc-api.s3na.xyz"
 
 # ─── Storage ───────────────────────────────────────────────────────────────────
 db_path = "psob-indexer.redb"

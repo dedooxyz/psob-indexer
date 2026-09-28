@@ -390,6 +390,13 @@ async fn ingest_chain(
             .map(|h| by_h.remove(h).expect("every height fetched"))
             .collect()
     };
+    // Locator hash by height — the wire payload must hash to this, otherwise
+    // the endpoint handed us a mismatched body.
+    let locator_hashes: std::collections::HashMap<u64, &String> = window
+        .iter()
+        .zip(hashes.iter())
+        .map(|(h, hx)| (*h, hx))
+        .collect();
 
     // Fetch wire payloads concurrently, collecting by height so verification can
     // run STRICTLY in height order (the linkage check depends on it).
@@ -421,6 +428,29 @@ async fn ingest_chain(
         let Some(wire) = wires.get(&height) else {
             continue;
         };
+        // Integrity gate FIRST: sha256d of the wire's 80-byte base must equal the
+        // locator hash the node gave us for this height. If it does not, the
+        // endpoint returned a mismatched payload — halt WITHOUT a rollback (or we
+        // would delete honest history on bad data) and say so clearly instead of
+        // failing later on a parse/verify error that means nothing.
+        if let Some(expected) = locator_hashes.get(&height) {
+            let Some(base80) = wire.get(..80) else {
+                tracing::warn!(chain = %chain.name, height, "wire shorter than 80 bytes; halting walk");
+                break;
+            };
+            let actual = display_hash(&common::sha256d(base80));
+            if !actual.eq_ignore_ascii_case(expected) {
+                tracing::warn!(
+                    chain = %chain.name,
+                    height,
+                    expected = %expected,
+                    actual = %actual,
+                    "wire hash does not match locator hash; halting walk (no rollback)"
+                );
+                break;
+            }
+        }
+
         let aux_block = match AuxBlock::from_wire(wire.clone()) {
             Ok(b) => b,
             Err(e) => {
@@ -453,12 +483,20 @@ async fn ingest_chain(
         // indexer silently merging two chains.
         if let Some(p) = prev_hash {
             if aux_block.base[4..36] != p {
+                // The disagreement is with the stored block BELOW this height:
+                // we store `{height}`, the node's wire says its parent
+                // (`{height-1}`) has a different hash than what we stored.
+                // Rolling back from `height` would delete nothing (we store
+                // `height` only after this gate) and leave the chain halted
+                // forever — the cursor never moves, the same tick repeats.
+                let stale_height = height.saturating_sub(1);
                 tracing::warn!(
                     chain = %chain.name,
                     height,
-                    "prev_hash linkage broken at {height} (reorg?) — rolling back and halting"
+                    stale_height,
+                    "prev_hash linkage broken at {height}: stored block {stale_height} disagrees with the node — rolling it back and halting"
                 );
-                db.rollback_from(chain.chain_id, height)?;
+                db.rollback_from(chain.chain_id, stale_height)?;
                 break;
             }
         }
